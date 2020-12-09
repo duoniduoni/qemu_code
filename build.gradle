@@ -2,19 +2,57 @@ apply plugin: 'sdk-files'
 
 import com.android.tools.internal.emulator.BuildEmulator
 
+// Get SDK revision to define emulator revision
+File fprops = new File(rootDir.getParentFile(), 'external/qemu/source.properties')
+Properties props = new Properties()
+props.load(fprops.newDataInputStream())
+
+// Mac/Win emulator now has dependency on haxm 6.2.1
+File fprops_mac = new File(rootDir.getParentFile(), 'external/qemu/mac.source.properties')
+File fprops_win = new File(rootDir.getParentFile(), 'external/qemu/win.source.properties')
+
 task buildDefaultEmulator(type: BuildEmulator) {
+    revision = props."Pkg.Revision"
+    build_number = System.getenv("BUILD_NUMBER")
     output = new File(project.buildDir, "default")
 }
 
+task buildEmulatorCodeCoverage(type: BuildEmulator) {
+    debug = true
+    revision = props."Pkg.Revision"
+    build_number = System.getenv("BUILD_NUMBER")
+    output = new File(project.buildDir, "coverage")
+}
+
+
 task buildWindowsEmulator(type: BuildEmulator) {
+    revision = props."Pkg.Revision"
+    build_number = System.getenv("BUILD_NUMBER")
     output = new File(project.buildDir, "windows")
     windows = true
 }
 
-sdk {
+// Package all data to construct a coverage report.
+task packageCodeCoverage(type: Zip) {
+    dependsOn buildEmulatorCodeCoverage
+    outputs.upToDateWhen { false }
+    archiveName = "code-coverage.zip"
+    destinationDir = new File(project.buildDir, "coverage")
+    from(buildEmulatorCodeCoverage.output) {
+        include "**/*.csv"
+    }
+    from(buildEmulatorCodeCoverage.output) {
+        include "**/*.gcda"
+    }
+    from(buildEmulatorCodeCoverage.output) {
+        include "**/*.gcno"
+    }
+}
 
+
+sdk {
     common(mac, linux) {
-        item('android/avd/hardware-properties.ini') {
+        item('android/android-emu/android/avd/hardware-properties.ini') {
             into 'lib'
             notice null
         }
@@ -22,9 +60,22 @@ sdk {
             executable true
             builtBy buildDefaultEmulator
         }
+        item("$buildDefaultEmulator.output/emulator-check") {
+            executable true
+            builtBy buildDefaultEmulator
+        }
+        item("$buildDefaultEmulator.output/bin64") {
+            into 'bin64'
+            builtBy buildDefaultEmulator
+        }
         item("$buildDefaultEmulator.output/qemu") {
             into 'qemu'
             builtBy buildDefaultEmulator
+        }
+        item("$buildDefaultEmulator.output/build/debug_info/qemu") {
+            into 'qemu'
+            builtBy buildDefaultEmulator
+            debug true
         }
         item("$buildDefaultEmulator.output/lib") {
             into 'lib'
@@ -34,21 +85,23 @@ sdk {
             into 'lib64'
             builtBy buildDefaultEmulator
         }
+        item("$buildDefaultEmulator.output/build/debug_info/lib64") {
+            into 'lib64'
+            builtBy buildDefaultEmulator
+            debug true
+        }
+        item("$buildDefaultEmulator.output/resources") {
+            into 'resources'
+            builtBy buildDefaultEmulator
+        }
         item("$project.rootDir/../prebuilts/qemu-kernel/x86/pc-bios/bios.bin") {
             into 'lib/pc-bios'
         }
         item("$project.rootDir/../prebuilts/qemu-kernel/x86/pc-bios/vgabios-cirrus.bin") {
             into 'lib/pc-bios'
         }
-
-        item("$buildDefaultEmulator.output/emulator64-ranchu-arm64") {
-            executable true
-            builtBy buildDefaultEmulator
-        }
-
-        item("$buildDefaultEmulator.output/emulator64-ranchu-mips64") {
-            executable true
-            builtBy buildDefaultEmulator
+        item("$project.rootDir/../external/qemu/android-info.txt") {
+            into ''
         }
 
         item("$buildDefaultEmulator.output/emulator64-arm") {
@@ -65,46 +118,88 @@ sdk {
             executable true
             builtBy buildDefaultEmulator
         }
+
+        item("$buildDefaultEmulator.output/emulator64-crash-service") {
+            executable true
+            builtBy buildDefaultEmulator
+        }
+
+        item("$buildDefaultEmulator.output/qemu-img") {
+            executable true
+            builtBy buildDefaultEmulator
+        }
+
+        // This will make it end up in the Debug configuration.
+        item("$buildEmulatorCodeCoverage.output/code-coverage.zip") {
+            debug true
+            into ''
+            builtBy  packageCodeCoverage
+        }
     }
 
-    // 32 bit binaries are linux only
     linux {
-        item("$buildDefaultEmulator.output/emulator-arm") {
-            executable true
-            builtBy buildDefaultEmulator
+        item(fprops) {
+            notice null
         }
-        item("$buildDefaultEmulator.output/emulator-mips") {
-            executable true
-            builtBy buildDefaultEmulator
-        }
-        item("$buildDefaultEmulator.output/emulator-x86") {
-            executable true
-            builtBy buildDefaultEmulator
-        }
-        item("$buildDefaultEmulator.output/emulator-ranchu-arm64") {
-            executable true
-            builtBy buildDefaultEmulator
-        }
-        item("$buildDefaultEmulator.output/emulator-ranchu-mips64") {
-            executable true
-            builtBy buildDefaultEmulator
+    }
+
+    mac {
+        item(fprops_mac) {
+            name 'source.properties'
+            notice null
         }
     }
 
     windows {
-        item('android/avd/hardware-properties.ini') {
+        item(fprops_win) {
+            name 'source.properties'
+            notice null
+        }
+        item('android/android-emu/android/avd/hardware-properties.ini') {
             into 'lib'
             notice null
         }
         item("$buildWindowsEmulator.output/emulator.exe") {
+            executable true
+            builtBy buildWindowsEmulator
+        }
+        item("$buildWindowsEmulator.output/emulator-check.exe") {
+            executable true
+            builtBy buildWindowsEmulator
+        }
+        item("$buildWindowsEmulator.output/bin") {
+            into 'bin'
             builtBy buildWindowsEmulator
         }
         item("$buildWindowsEmulator.output/qemu") {
             into 'qemu'
             builtBy buildWindowsEmulator
         }
+        item("$buildWindowsEmulator.output/build/debug_info/qemu") {
+            into 'qemu'
+            builtBy buildWindowsEmulator
+            debug true
+        }
         item("$buildWindowsEmulator.output/lib") {
             into 'lib'
+            builtBy buildWindowsEmulator
+        }
+        item("$buildWindowsEmulator.output/build/debug_info/lib") {
+            into 'lib'
+            builtBy buildWindowsEmulator
+            debug true
+        }
+        item("$buildWindowsEmulator.output/lib64") {
+            into 'lib64'
+            builtBy buildWindowsEmulator
+        }
+        item("$buildWindowsEmulator.output/build/debug_info/lib64") {
+            into 'lib64'
+            builtBy buildWindowsEmulator
+            debug true
+        }
+        item("$buildWindowsEmulator.output/resources") {
+            into 'resources'
             builtBy buildWindowsEmulator
         }
         item("$project.rootDir/../prebuilts/qemu-kernel/x86/pc-bios/bios.bin") {
@@ -113,43 +208,108 @@ sdk {
         item("$project.rootDir/../prebuilts/qemu-kernel/x86/pc-bios/vgabios-cirrus.bin") {
             into 'lib/pc-bios'
         }
+        item("$project.rootDir/../external/qemu/android-info.txt") {
+            into ''
+        }
 
-        item("$buildWindowsEmulator.output/emulator64-ranchu-arm64.exe") {
-            builtBy buildWindowsEmulator
-        }
-        item("$buildWindowsEmulator.output/emulator64-ranchu-mips64.exe") {
-            builtBy buildWindowsEmulator
-        }
-        item("$buildWindowsEmulator.output/emulator-ranchu-arm64.exe") {
-            builtBy buildWindowsEmulator
-        }
-        item("$buildWindowsEmulator.output/emulator-ranchu-mips64.exe") {
-            builtBy buildWindowsEmulator
-        }
         item("$buildWindowsEmulator.output/emulator-arm.exe") {
+            executable true
             builtBy buildWindowsEmulator
         }
         item("$buildWindowsEmulator.output/emulator-mips.exe") {
+            executable true
             builtBy buildWindowsEmulator
         }
         item("$buildWindowsEmulator.output/emulator-x86.exe") {
+            executable true
+            builtBy buildWindowsEmulator
+        }
+        item("$buildWindowsEmulator.output/emulator-crash-service.exe") {
+            executable true
             builtBy buildWindowsEmulator
         }
 
-/*
-XAV(2014-06-17): DISABLE win64 exe until it's ready
+        item("$buildWindowsEmulator.output/emulator64-crash-service.exe") {
+            executable true
+            builtBy buildWindowsEmulator
+        }
+
         item("$buildWindowsEmulator.output/emulator64-arm.exe") {
+            executable true
             builtBy buildWindowsEmulator
         }
 
         item("$buildWindowsEmulator.output/emulator64-mips.exe") {
+            executable true
             builtBy buildWindowsEmulator
         }
 
         item("$buildWindowsEmulator.output/emulator64-x86.exe") {
+            executable true
             builtBy buildWindowsEmulator
         }
-*/
+
+        item("$buildWindowsEmulator.output/qemu-img.exe") {
+            executable true
+            builtBy buildWindowsEmulator
+        }
+
     }
 }
 
+import com.android.tools.internal.sdk.base.PlatformConfig
+import com.android.tools.internal.sdk.base.ToolItem
+import com.google.common.collect.Lists
+// Duplicate 'emulator' executables for debug info paths
+for (PlatformConfig platform : sdk.getPlatforms()) {
+    def itemlist = Lists.newArrayList()
+    for (ToolItem toolitem: platform.getItems()) {
+        if (toolitem.getDebug() || !toolitem.getExecutable()) {
+            continue
+        }
+        def prop = toolitem.properties
+        def itemPath = prop.itemPath
+        if (itemPath instanceof String || itemPath instanceof GString) {
+            def debugItemPath = itemPath
+            def path = debugItemPath.split("/")
+            def s = path[path.size()-1]
+            if (!s.contains("emulator")) {
+                continue
+            }
+            if (platform.getName().equals("win")) {
+                debugItemPath = debugItemPath.replaceFirst("$buildWindowsEmulator.output",
+                                "$buildWindowsEmulator.output/build/debug_info")
+            } else {
+                debugItemPath = debugItemPath.replaceFirst("$buildDefaultEmulator.output",
+                                "$buildDefaultEmulator.output/build/debug_info")
+            }
+            if (debugItemPath.equals(itemPath)) {
+                continue
+            }
+            if (platform.getName().equals("mac")) {
+                debugItemPath += ".dSYM"
+                if (!prop.destinationPath) {
+                    path = debugItemPath.split("/")
+                    prop.destinationPath = path[path.size()-1]
+                }
+
+            }
+            prop.debug=true;
+            prop.remove('itemPath')
+            prop.remove('class')
+            def propcopy = {
+                prop.each { k, v ->
+                    delegate."$k"=v
+                }
+                return debugItemPath
+            }
+            def debugitem = new ToolItem(propcopy)
+            propcopy.delegate = debugitem
+            itemlist.add(debugitem)
+        }
+
+    }
+    for (ToolItem debugitem: itemlist) {
+        platform.getItems().add(debugitem)
+    }
+}

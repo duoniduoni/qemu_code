@@ -1,8 +1,8 @@
 /*
  * QEMU curses/ncurses display driver
- *
+ * 
  * Copyright (c) 2005 Andrzej Zaborowski  <balrog@zabor.org>
- *
+ * 
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
  * in the Software without restriction, including without limitation the rights
@@ -21,37 +21,52 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#include <curses.h>
+#include "qemu/osdep.h"
 
 #ifndef _WIN32
-#include <signal.h>
 #include <sys/ioctl.h>
 #include <termios.h>
 #endif
 
-#ifdef __OpenBSD__
-#define resize_term resizeterm
-#endif
-
 #include "qemu-common.h"
 #include "ui/console.h"
+#include "ui/input.h"
 #include "sysemu/sysemu.h"
+
+/* KEY_EVENT is defined in wincon.h and in curses.h. Avoid redefinition. */
+#undef KEY_EVENT
+#include <curses.h>
+#undef KEY_EVENT
 
 #define FONT_HEIGHT 16
 #define FONT_WIDTH 8
 
+static DisplayChangeListener *dcl;
 static console_ch_t screen[160 * 100];
 static WINDOW *screenpad = NULL;
 static int width, height, gwidth, gheight, invalidate;
 static int px, py, sminx, sminy, smaxx, smaxy;
 
-static void curses_update(DisplayState *ds, int x, int y, int w, int h)
-{
-    chtype *line;
+static chtype vga_to_curses[256];
 
-    line = ((chtype *) screen) + y * width;
-    for (h += y; y < h; y ++, line += width)
-        mvwaddchnstr(screenpad, y, 0, line, width);
+static void curses_update(DisplayChangeListener *dcl,
+                          int x, int y, int w, int h)
+{
+    console_ch_t *line;
+    chtype curses_line[width];
+
+    line = screen + y * width;
+    for (h += y; y < h; y ++, line += width) {
+        for (x = 0; x < width; x++) {
+            chtype ch = line[x] & 0xff;
+            chtype at = line[x] & ~0xff;
+            if (vga_to_curses[ch]) {
+                ch = vga_to_curses[ch];
+            }
+            curses_line[x] = ch | at;
+        }
+        mvwaddchnstr(screenpad, y, 0, curses_line, width);
+    }
 
     pnoutrefresh(screenpad, py, px, sminy, sminx, smaxy - 1, smaxx - 1);
     refresh();
@@ -59,7 +74,7 @@ static void curses_update(DisplayState *ds, int x, int y, int w, int h)
 
 static void curses_calc_pad(void)
 {
-    if (is_fixedsize_console()) {
+    if (qemu_console_is_fixedsize(NULL)) {
         width = gwidth;
         height = gheight;
     } else {
@@ -96,22 +111,22 @@ static void curses_calc_pad(void)
     }
 }
 
-static void curses_resize(DisplayState *ds)
+static void curses_resize(DisplayChangeListener *dcl,
+                          int width, int height)
 {
-    if (ds_get_width(ds) == gwidth && ds_get_height(ds) == gheight)
+    if (width == gwidth && height == gheight) {
         return;
+    }
 
-    gwidth = ds_get_width(ds);
-    gheight = ds_get_height(ds);
+    gwidth = width;
+    gheight = height;
 
     curses_calc_pad();
-    ds->surface->width = width * FONT_WIDTH;
-    ds->surface->height = height * FONT_HEIGHT;
 }
 
-#ifndef _WIN32
-#if defined(SIGWINCH) && defined(KEY_RESIZE)
-static void curses_winch_handler(int signum)
+#if !defined(_WIN32) && defined(SIGWINCH) && defined(KEY_RESIZE)
+static volatile sig_atomic_t got_sigwinch;
+static void curses_winch_check(void)
 {
     struct winsize {
         unsigned short ws_row;
@@ -120,21 +135,38 @@ static void curses_winch_handler(int signum)
         unsigned short ws_ypixel;   /* unused */
     } ws;
 
-    /* terminal size changed */
-    if (ioctl(1, TIOCGWINSZ, &ws) == -1)
+    if (!got_sigwinch) {
         return;
+    }
+    got_sigwinch = false;
+
+    if (ioctl(1, TIOCGWINSZ, &ws) == -1) {
+        return;
+    }
 
     resize_term(ws.ws_row, ws.ws_col);
-    curses_calc_pad();
     invalidate = 1;
-
-    /* some systems require this */
-    signal(SIGWINCH, curses_winch_handler);
 }
-#endif
+
+static void curses_winch_handler(int signum)
+{
+    got_sigwinch = true;
+}
+
+static void curses_winch_init(void)
+{
+    struct sigaction old, winch = {
+        .sa_handler  = curses_winch_handler,
+    };
+    sigaction(SIGWINCH, &winch, &old);
+}
+#else
+static void curses_winch_check(void) {}
+static void curses_winch_init(void) {}
 #endif
 
-static void curses_cursor_position(DisplayState *ds, int x, int y)
+static void curses_cursor_position(DisplayChangeListener *dcl,
+                                   int x, int y)
 {
     if (x >= 0) {
         x = sminx + x - px;
@@ -145,8 +177,9 @@ static void curses_cursor_position(DisplayState *ds, int x, int y)
             curs_set(1);
             /* it seems that curs_set(1) must always be called before
              * curs_set(2) for the latter to have effect */
-            if (!is_graphic_console())
+            if (!qemu_console_is_graphic(NULL)) {
                 curs_set(2);
+            }
             return;
         }
     }
@@ -159,33 +192,26 @@ static void curses_cursor_position(DisplayState *ds, int x, int y)
 #include "curses_keys.h"
 
 static kbd_layout_t *kbd_layout = NULL;
-static int keycode2keysym[CURSES_KEYS];
 
-static void curses_refresh(DisplayState *ds)
+static void curses_refresh(DisplayChangeListener *dcl)
 {
-    int chr, nextchr, keysym, keycode;
+    int chr, keysym, keycode, keycode_alt;
+
+    curses_winch_check();
 
     if (invalidate) {
         clear();
         refresh();
         curses_calc_pad();
-        ds->surface->width = FONT_WIDTH * width;
-        ds->surface->height = FONT_HEIGHT * height;
-        vga_hw_invalidate();
+        graphic_hw_invalidate(NULL);
         invalidate = 0;
     }
 
-    vga_hw_text_update(screen);
+    graphic_hw_text_update(NULL, screen);
 
-    nextchr = ERR;
     while (1) {
         /* while there are any pending key strokes to process */
-        if (nextchr == ERR)
-            chr = getch();
-        else {
-            chr = nextchr;
-            nextchr = ERR;
-        }
+        chr = getch();
 
         if (chr == ERR)
             break;
@@ -196,74 +222,113 @@ static void curses_refresh(DisplayState *ds)
             clear();
             refresh();
             curses_calc_pad();
-            curses_update(ds, 0, 0, width, height);
-            ds->surface->width = FONT_WIDTH * width;
-            ds->surface->height = FONT_HEIGHT * height;
+            curses_update(dcl, 0, 0, width, height);
             continue;
         }
 #endif
 
         keycode = curses2keycode[chr];
-        if (keycode == -1)
-            continue;
+        keycode_alt = 0;
 
         /* alt key */
         if (keycode == 1) {
-            nextchr = getch();
+            int nextchr = getch();
 
             if (nextchr != ERR) {
-                keycode = curses2keycode[nextchr];
-                nextchr = ERR;
-                if (keycode == -1)
-                    continue;
+                chr = nextchr;
+                keycode_alt = ALT;
+                keycode = curses2keycode[chr];
 
-                keycode |= ALT;
+                if (keycode != -1) {
+                    keycode |= ALT;
 
-                /* process keys reserved for qemu */
-                if (keycode >= QEMU_KEY_CONSOLE0 &&
-                        keycode < QEMU_KEY_CONSOLE0 + 9) {
-                    erase();
-                    wnoutrefresh(stdscr);
-                    console_select(keycode - QEMU_KEY_CONSOLE0);
+                    /* process keys reserved for qemu */
+                    if (keycode >= QEMU_KEY_CONSOLE0 &&
+                            keycode < QEMU_KEY_CONSOLE0 + 9) {
+                        erase();
+                        wnoutrefresh(stdscr);
+                        console_select(keycode - QEMU_KEY_CONSOLE0);
 
-                    invalidate = 1;
-                    continue;
+                        invalidate = 1;
+                        continue;
+                    }
                 }
             }
         }
 
-        if (kbd_layout && !(keycode & GREY)) {
-            keysym = keycode2keysym[keycode & KEY_MASK];
-            if (keysym == -1)
-                keysym = chr;
+        if (kbd_layout) {
+            keysym = -1;
+            if (chr < CURSES_KEYS)
+                keysym = curses2keysym[chr];
 
-            keycode &= ~KEY_MASK;
-            keycode |= keysym2scancode(kbd_layout, keysym);
+            if (keysym == -1) {
+                if (chr < ' ') {
+                    keysym = chr + '@';
+                    if (keysym >= 'A' && keysym <= 'Z')
+                        keysym += 'a' - 'A';
+                    keysym |= KEYSYM_CNTRL;
+                } else
+                    keysym = chr;
+            }
+
+            keycode = keysym2scancode(kbd_layout, keysym & KEYSYM_MASK,
+                                      false, false, false);
+            if (keycode == 0)
+                continue;
+
+            keycode |= (keysym & ~KEYSYM_MASK) >> 16;
+            keycode |= keycode_alt;
         }
 
-        if (is_graphic_console()) {
+        if (keycode == -1)
+            continue;
+
+        if (qemu_console_is_graphic(NULL)) {
             /* since terminals don't know about key press and release
              * events, we need to emit both for each key received */
-            if (keycode & SHIFT)
-                kbd_put_keycode(SHIFT_CODE);
-            if (keycode & CNTRL)
-                kbd_put_keycode(CNTRL_CODE);
-            if (keycode & ALT)
-                kbd_put_keycode(ALT_CODE);
-            if (keycode & GREY)
-                kbd_put_keycode(GREY_CODE);
-            kbd_put_keycode(keycode & KEY_MASK);
-            if (keycode & GREY)
-                kbd_put_keycode(GREY_CODE);
-            kbd_put_keycode((keycode & KEY_MASK) | KEY_RELEASE);
-            if (keycode & ALT)
-                kbd_put_keycode(ALT_CODE | KEY_RELEASE);
-            if (keycode & CNTRL)
-                kbd_put_keycode(CNTRL_CODE | KEY_RELEASE);
-            if (keycode & SHIFT)
-                kbd_put_keycode(SHIFT_CODE | KEY_RELEASE);
+            if (keycode & SHIFT) {
+                qemu_input_event_send_key_number(NULL, SHIFT_CODE, true);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & CNTRL) {
+                qemu_input_event_send_key_number(NULL, CNTRL_CODE, true);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & ALT) {
+                qemu_input_event_send_key_number(NULL, ALT_CODE, true);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & ALTGR) {
+                qemu_input_event_send_key_number(NULL, GREY | ALT_CODE, true);
+                qemu_input_event_send_key_delay(0);
+            }
+
+            qemu_input_event_send_key_number(NULL, keycode & KEY_MASK, true);
+            qemu_input_event_send_key_delay(0);
+            qemu_input_event_send_key_number(NULL, keycode & KEY_MASK, false);
+            qemu_input_event_send_key_delay(0);
+
+            if (keycode & ALTGR) {
+                qemu_input_event_send_key_number(NULL, GREY | ALT_CODE, false);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & ALT) {
+                qemu_input_event_send_key_number(NULL, ALT_CODE, false);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & CNTRL) {
+                qemu_input_event_send_key_number(NULL, CNTRL_CODE, false);
+                qemu_input_event_send_key_delay(0);
+            }
+            if (keycode & SHIFT) {
+                qemu_input_event_send_key_number(NULL, SHIFT_CODE, false);
+                qemu_input_event_send_key_delay(0);
+            }
         } else {
-            keysym = curses2keysym[chr];
+            keysym = -1;
+            if (chr < CURSES_KEYS) {
+                keysym = curses2qemu[chr];
+            }
             if (keysym == -1)
                 keysym = chr;
 
@@ -272,21 +337,22 @@ static void curses_refresh(DisplayState *ds)
     }
 }
 
-static void curses_cleanup(void *opaque)
-{
-    endwin();
-}
-
 static void curses_atexit(void)
 {
-    curses_cleanup(NULL);
+    endwin();
 }
 
 static void curses_setup(void)
 {
     int i, colour_default[8] = {
-        COLOR_BLACK, COLOR_BLUE, COLOR_GREEN, COLOR_CYAN,
-        COLOR_RED, COLOR_MAGENTA, COLOR_YELLOW, COLOR_WHITE,
+        [QEMU_COLOR_BLACK]   = COLOR_BLACK,
+        [QEMU_COLOR_BLUE]    = COLOR_BLUE,
+        [QEMU_COLOR_GREEN]   = COLOR_GREEN,
+        [QEMU_COLOR_CYAN]    = COLOR_CYAN,
+        [QEMU_COLOR_RED]     = COLOR_RED,
+        [QEMU_COLOR_MAGENTA] = COLOR_MAGENTA,
+        [QEMU_COLOR_YELLOW]  = COLOR_YELLOW,
+        [QEMU_COLOR_WHITE]   = COLOR_WHITE,
     };
 
     /* input as raw as possible, let everything be interpreted
@@ -295,14 +361,60 @@ static void curses_setup(void)
     nodelay(stdscr, TRUE); nonl(); keypad(stdscr, TRUE);
     start_color(); raw(); scrollok(stdscr, FALSE);
 
-    for (i = 0; i < 64; i ++)
+    /* Make color pair to match color format (3bits bg:3bits fg) */
+    for (i = 0; i < 64; i++) {
         init_pair(i, colour_default[i & 7], colour_default[i >> 3]);
+    }
+    /* Set default color for more than 64 for safety. */
+    for (i = 64; i < COLOR_PAIRS; i++) {
+        init_pair(i, COLOR_WHITE, COLOR_BLACK);
+    }
+
+    /*
+     * Setup mapping for vga to curses line graphics.
+     * FIXME: for better font, have to use ncursesw and setlocale()
+     */
+#if 0
+    /* FIXME: map from where? */
+    ACS_S1;
+    ACS_S3;
+    ACS_S7;
+    ACS_S9;
+#endif
+    /* ACS_* is not constant. So, we can't initialize statically. */
+    vga_to_curses['\0'] = ' ';
+    vga_to_curses[0x04] = ACS_DIAMOND;
+    vga_to_curses[0x18] = ACS_UARROW;
+    vga_to_curses[0x19] = ACS_DARROW;
+    vga_to_curses[0x1a] = ACS_RARROW;
+    vga_to_curses[0x1b] = ACS_LARROW;
+    vga_to_curses[0x9c] = ACS_STERLING;
+    vga_to_curses[0xb0] = ACS_BOARD;
+    vga_to_curses[0xb1] = ACS_CKBOARD;
+    vga_to_curses[0xb3] = ACS_VLINE;
+    vga_to_curses[0xb4] = ACS_RTEE;
+    vga_to_curses[0xbf] = ACS_URCORNER;
+    vga_to_curses[0xc0] = ACS_LLCORNER;
+    vga_to_curses[0xc1] = ACS_BTEE;
+    vga_to_curses[0xc2] = ACS_TTEE;
+    vga_to_curses[0xc3] = ACS_LTEE;
+    vga_to_curses[0xc4] = ACS_HLINE;
+    vga_to_curses[0xc5] = ACS_PLUS;
+    vga_to_curses[0xce] = ACS_LANTERN;
+    vga_to_curses[0xd8] = ACS_NEQUAL;
+    vga_to_curses[0xd9] = ACS_LRCORNER;
+    vga_to_curses[0xda] = ACS_ULCORNER;
+    vga_to_curses[0xdb] = ACS_BLOCK;
+    vga_to_curses[0xe3] = ACS_PI;
+    vga_to_curses[0xf1] = ACS_PLMINUS;
+    vga_to_curses[0xf2] = ACS_GEQUAL;
+    vga_to_curses[0xf3] = ACS_LEQUAL;
+    vga_to_curses[0xf8] = ACS_DEGREE;
+    vga_to_curses[0xfe] = ACS_BULLET;
 }
 
 static void curses_keyboard_setup(void)
 {
-    int i, keycode, keysym;
-
 #if defined(__APPLE__)
     /* always use generic keymaps */
     if (!keyboard_layout)
@@ -313,32 +425,18 @@ static void curses_keyboard_setup(void)
         if (!kbd_layout)
             exit(1);
     }
-
-    for (i = 0; i < CURSES_KEYS; i ++)
-        keycode2keysym[i] = -1;
-
-    for (i = 0; i < CURSES_KEYS; i ++) {
-        if (curses2keycode[i] == -1)
-            continue;
-
-        keycode = curses2keycode[i] & KEY_MASK;
-        if (keycode2keysym[keycode] >= 0)
-            continue;
-
-        for (keysym = 0; keysym < CURSES_KEYS; keysym ++)
-            if (curses2keycode[keysym] == keycode) {
-                keycode2keysym[keycode] = keysym;
-                break;
-            }
-
-        if (keysym >= CURSES_KEYS)
-            keycode2keysym[keycode] = i;
-    }
 }
 
-void curses_display_init(DisplayState *ds, int full_screen)
+static const DisplayChangeListenerOps dcl_ops = {
+    .dpy_name        = "curses",
+    .dpy_text_update = curses_update,
+    .dpy_text_resize = curses_resize,
+    .dpy_refresh     = curses_refresh,
+    .dpy_text_cursor = curses_cursor_position,
+};
+
+static void curses_display_init(DisplayState *ds, DisplayOptions *opts)
 {
-    DisplayChangeListener *dcl;
 #ifndef _WIN32
     if (!isatty(1)) {
         fprintf(stderr, "We need a terminal output\n");
@@ -350,22 +448,23 @@ void curses_display_init(DisplayState *ds, int full_screen)
     curses_keyboard_setup();
     atexit(curses_atexit);
 
-#ifndef _WIN32
-#if defined(SIGWINCH) && defined(KEY_RESIZE)
-    /* some curses implementations provide a handler, but we
-     * want to be sure this is handled regardless of the library */
-    signal(SIGWINCH, curses_winch_handler);
-#endif
-#endif
+    curses_winch_init();
 
-    dcl = (DisplayChangeListener *) g_malloc0(sizeof(DisplayChangeListener));
-    dcl->dpy_update = curses_update;
-    dcl->dpy_resize = curses_resize;
-    dcl->dpy_refresh = curses_refresh;
-    dcl->dpy_text_cursor = curses_cursor_position;
-    register_displaychangelistener(ds, dcl);
-    qemu_free_displaysurface(ds);
-    ds->surface = qemu_create_displaysurface_from(640, 400, 0, 0, (uint8_t*) screen);
+    dcl = g_new0(DisplayChangeListener, 1);
+    dcl->ops = &dcl_ops;
+    register_displaychangelistener(dcl);
 
     invalidate = 1;
 }
+
+static QemuDisplay qemu_display_curses = {
+    .type       = DISPLAY_TYPE_CURSES,
+    .init       = curses_display_init,
+};
+
+static void register_curses(void)
+{
+    qemu_display_register(&qemu_display_curses);
+}
+
+type_init(register_curses);

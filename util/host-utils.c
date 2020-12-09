@@ -23,12 +23,11 @@
  * THE SOFTWARE.
  */
 
-#include <stdlib.h>
-#include <stdint.h>
+#include "qemu/osdep.h"
 #include "qemu/host-utils.h"
 
-/* Long integer helpers */
 #ifndef CONFIG_INT128
+/* Long integer helpers */
 static inline void mul64(uint64_t *plow, uint64_t *phigh,
                          uint64_t a, uint64_t b)
 {
@@ -86,4 +85,143 @@ void muls64 (uint64_t *plow, uint64_t *phigh, int64_t a, int64_t b)
     }
     *phigh = rh;
 }
-#endif /* !CONFIG_INT128 */
+
+/* Unsigned 128x64 division.  Returns 1 if overflow (divide by zero or */
+/* quotient exceeds 64 bits).  Otherwise returns quotient via plow and */
+/* remainder via phigh. */
+int divu128(uint64_t *plow, uint64_t *phigh, uint64_t divisor)
+{
+    uint64_t dhi = *phigh;
+    uint64_t dlo = *plow;
+    unsigned i;
+    uint64_t carry = 0;
+
+    if (divisor == 0) {
+        return 1;
+    } else if (dhi == 0) {
+        *plow  = dlo / divisor;
+        *phigh = dlo % divisor;
+        return 0;
+    } else if (dhi > divisor) {
+        return 1;
+    } else {
+
+        for (i = 0; i < 64; i++) {
+            carry = dhi >> 63;
+            dhi = (dhi << 1) | (dlo >> 63);
+            if (carry || (dhi >= divisor)) {
+                dhi -= divisor;
+                carry = 1;
+            } else {
+                carry = 0;
+            }
+            dlo = (dlo << 1) | carry;
+        }
+
+        *plow = dlo;
+        *phigh = dhi;
+        return 0;
+    }
+}
+
+int divs128(int64_t *plow, int64_t *phigh, int64_t divisor)
+{
+    int sgn_dvdnd = *phigh < 0;
+    int sgn_divsr = divisor < 0;
+    int overflow = 0;
+
+    if (sgn_dvdnd) {
+        *plow = ~(*plow);
+        *phigh = ~(*phigh);
+        if (*plow == (int64_t)-1) {
+            *plow = 0;
+            (*phigh)++;
+         } else {
+            (*plow)++;
+         }
+    }
+
+    if (sgn_divsr) {
+        divisor = 0 - divisor;
+    }
+
+    overflow = divu128((uint64_t *)plow, (uint64_t *)phigh, (uint64_t)divisor);
+
+    if (sgn_dvdnd  ^ sgn_divsr) {
+        *plow = 0 - *plow;
+    }
+
+    if (!overflow) {
+        if ((*plow < 0) ^ (sgn_dvdnd ^ sgn_divsr)) {
+            overflow = 1;
+        }
+    }
+
+    return overflow;
+}
+#endif
+
+/**
+ * urshift - 128-bit Unsigned Right Shift.
+ * @plow: in/out - lower 64-bit integer.
+ * @phigh: in/out - higher 64-bit integer.
+ * @shift: in - bytes to shift, between 0 and 127.
+ *
+ * Result is zero-extended and stored in plow/phigh, which are
+ * input/output variables. Shift values outside the range will
+ * be mod to 128. In other words, the caller is responsible to
+ * verify/assert both the shift range and plow/phigh pointers.
+ */
+void urshift(uint64_t *plow, uint64_t *phigh, int32_t shift)
+{
+    shift &= 127;
+    if (shift == 0) {
+        return;
+    }
+
+    uint64_t h = *phigh >> (shift & 63);
+    if (shift >= 64) {
+        *plow = h;
+        *phigh = 0;
+    } else {
+        *plow = (*plow >> (shift & 63)) | (*phigh << (64 - (shift & 63)));
+        *phigh = h;
+    }
+}
+
+/**
+ * ulshift - 128-bit Unsigned Left Shift.
+ * @plow: in/out - lower 64-bit integer.
+ * @phigh: in/out - higher 64-bit integer.
+ * @shift: in - bytes to shift, between 0 and 127.
+ * @overflow: out - true if any 1-bit is shifted out.
+ *
+ * Result is zero-extended and stored in plow/phigh, which are
+ * input/output variables. Shift values outside the range will
+ * be mod to 128. In other words, the caller is responsible to
+ * verify/assert both the shift range and plow/phigh pointers.
+ */
+void ulshift(uint64_t *plow, uint64_t *phigh, int32_t shift, bool *overflow)
+{
+    uint64_t low = *plow;
+    uint64_t high = *phigh;
+
+    shift &= 127;
+    if (shift == 0) {
+        return;
+    }
+
+    /* check if any bit will be shifted out */
+    urshift(&low, &high, 128 - shift);
+    if (low | high) {
+        *overflow = true;
+    }
+
+    if (shift >= 64) {
+        *phigh = *plow << (shift & 63);
+        *plow = 0;
+    } else {
+        *phigh = (*plow >> (64 - (shift & 63))) | (*phigh << (shift & 63));
+        *plow = *plow << shift;
+    }
+}

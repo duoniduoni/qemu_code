@@ -10,12 +10,8 @@
  * See the COPYING file in the top-level directory.
  */
 
-#ifndef QEMU_ERROR_H
-#define QEMU_ERROR_H
-
-#include <stdarg.h>
-#include <stdbool.h>
-#include "qemu/compiler.h"
+#ifndef QEMU_ERROR_REPORT_H
+#define QEMU_ERROR_REPORT_H
 
 typedef struct Location {
     /* all members are private to qemu-error.c */
@@ -31,15 +27,23 @@ Location *loc_pop(Location *loc);
 Location *loc_save(Location *loc);
 void loc_restore(Location *loc);
 void loc_set_none(void);
-void loc_set_cmdline(char **argv, int idx, int cnt);
+void loc_set_cmdline(const char **argv, int idx, int cnt);
 void loc_set_file(const char *fname, int lno);
 
 void error_vprintf(const char *fmt, va_list ap) GCC_FMT_ATTR(1, 0);
 void error_printf(const char *fmt, ...) GCC_FMT_ATTR(1, 2);
+void error_vprintf_unless_qmp(const char *fmt, va_list ap) GCC_FMT_ATTR(1, 0);
 void error_printf_unless_qmp(const char *fmt, ...) GCC_FMT_ATTR(1, 2);
-void error_print_loc(void);
 void error_set_progname(const char *argv0);
+
+void error_vreport(const char *fmt, va_list ap) GCC_FMT_ATTR(1, 0);
+void warn_vreport(const char *fmt, va_list ap) GCC_FMT_ATTR(1, 0);
+void info_vreport(const char *fmt, va_list ap) GCC_FMT_ATTR(1, 0);
+
 void error_report(const char *fmt, ...) GCC_FMT_ATTR(1, 2);
+void warn_report(const char *fmt, ...) GCC_FMT_ATTR(1, 2);
+void info_report(const char *fmt, ...) GCC_FMT_ATTR(1, 2);
+
 const char *error_get_progname(void);
 extern bool enable_timestamp_msg;
 

@@ -1,37 +1,45 @@
-/*
- * QEMU System Emulator
- *
- * Copyright (c) 2003-2008 Fabrice Bellard
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
 #ifndef QEMU_CPUS_H
 #define QEMU_CPUS_H
 
-void tcg_cpu_exec(void);
-void vm_state_notify(int running, int reason);
-extern int tbflush_requested;
-extern int debug_requested;
+#include "qemu/timer.h"
 
+/* cpus.c */
+bool qemu_in_vcpu_thread(void);
+void qemu_init_cpu_loop(void);
 void resume_all_vcpus(void);
 void pause_all_vcpus(void);
-int qemu_init_main_loop(void);
-void main_loop(void);
+void cpu_stop_current(void);
+void cpu_ticks_init(void);
 
-#endif /* QEMU_CPUS_H */
+void configure_icount(QemuOpts *opts, Error **errp);
+extern int use_icount;
+extern int icount_align_option;
+
+/* drift information for info jit command */
+extern int64_t max_delay;
+extern int64_t max_advance;
+void dump_drift_info(FILE *f, fprintf_function cpu_fprintf);
+
+/* Unblock cpu */
+void qemu_cpu_kick_self(void);
+void qemu_timer_notify_cb(void *opaque, QEMUClockType type);
+
+void cpu_synchronize_all_states(void);
+void cpu_synchronize_all_post_reset(void);
+void cpu_synchronize_all_post_init(void);
+void cpu_synchronize_all_pre_loadvm(void);
+
+void qtest_clock_warp(int64_t dest);
+
+#ifndef CONFIG_USER_ONLY
+/* vl.c */
+/* *-user doesn't have configurable SMP topology */
+extern int smp_cores;
+extern int smp_threads;
+#endif
+
+void list_cpus(FILE *f, fprintf_function cpu_fprintf, const char *optarg);
+
+void qemu_tcg_configure(QemuOpts *opts, Error **errp);
+
+#endif

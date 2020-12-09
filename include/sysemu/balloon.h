@@ -11,17 +11,18 @@
  *
  */
 
-#ifndef _QEMU_BALLOON_H
-#define _QEMU_BALLOON_H
+#ifndef QEMU_BALLOON_H
+#define QEMU_BALLOON_H
 
-#include "exec/cpu-defs.h"
+#include "qapi/qapi-types-misc.h"
 
-typedef ram_addr_t (QEMUBalloonEvent)(void *opaque, ram_addr_t target);
+typedef void (QEMUBalloonEvent)(void *opaque, ram_addr_t target);
+typedef void (QEMUBalloonStatus)(void *opaque, BalloonInfo *info);
 
-void qemu_add_balloon_handler(QEMUBalloonEvent *func, void *opaque);
-
-void qemu_balloon(ram_addr_t target);
-
-ram_addr_t qemu_balloon_status(void);
+int qemu_add_balloon_handler(QEMUBalloonEvent *event_func,
+			     QEMUBalloonStatus *stat_func, void *opaque);
+void qemu_remove_balloon_handler(void *opaque);
+bool qemu_balloon_is_inhibited(void);
+void qemu_balloon_inhibit(bool state);
 
 #endif

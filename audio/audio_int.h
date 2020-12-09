@@ -21,12 +21,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #ifndef QEMU_AUDIO_INT_H
 #define QEMU_AUDIO_INT_H
 
-#include "audio/audio.h"
-
-#ifdef CONFIG_COREAUDIO
+#ifdef CONFIG_AUDIO_COREAUDIO
 #define FLOAT_MIXENG
 /* #define RECIPROCAL */
 #endif
@@ -84,6 +83,7 @@ typedef struct HWVoiceOut {
     int samples;
     QLIST_HEAD (sw_out_listhead, SWVoiceOut) sw_head;
     QLIST_HEAD (sw_cap_listhead, SWVoiceCap) cap_head;
+    int ctl_caps;
     struct audio_pcm_ops *pcm_ops;
     QLIST_ENTRY (HWVoiceOut) entries;
 } HWVoiceOut;
@@ -103,6 +103,7 @@ typedef struct HWVoiceIn {
 
     int samples;
     QLIST_HEAD (sw_in_listhead, SWVoiceIn) sw_head;
+    int ctl_caps;
     struct audio_pcm_ops *pcm_ops;
     QLIST_ENTRY (HWVoiceIn) entries;
 } HWVoiceIn;
@@ -140,6 +141,7 @@ struct SWVoiceIn {
     QLIST_ENTRY (SWVoiceIn) entries;
 };
 
+typedef struct audio_driver audio_driver;
 struct audio_driver {
     const char *name;
     const char *descr;
@@ -152,16 +154,18 @@ struct audio_driver {
     int max_voices_in;
     int voice_size_out;
     int voice_size_in;
+    int ctl_caps;
+    QLIST_ENTRY(audio_driver) next;
 };
 
 struct audio_pcm_ops {
-    int  (*init_out)(HWVoiceOut *hw, struct audsettings *as);
+    int  (*init_out)(HWVoiceOut *hw, struct audsettings *as, void *drv_opaque);
     void (*fini_out)(HWVoiceOut *hw);
     int  (*run_out) (HWVoiceOut *hw, int live);
     int  (*write)   (SWVoiceOut *sw, void *buf, int size);
     int  (*ctl_out) (HWVoiceOut *hw, int cmd, ...);
 
-    int  (*init_in) (HWVoiceIn *hw, struct audsettings *as);
+    int  (*init_in) (HWVoiceIn *hw, struct audsettings *as, void *drv_opaque);
     void (*fini_in) (HWVoiceIn *hw);
     int  (*run_in)  (HWVoiceIn *hw);
     int  (*read)    (SWVoiceIn *sw, void *buf, int size);
@@ -201,19 +205,10 @@ struct AudioState {
     int vm_running;
 };
 
-extern struct audio_driver no_audio_driver;
-extern struct audio_driver oss_audio_driver;
-extern struct audio_driver sdl_audio_driver;
-extern struct audio_driver win_audio_driver;
-extern struct audio_driver wav_audio_driver;
-extern struct audio_driver fmod_audio_driver;
-extern struct audio_driver alsa_audio_driver;
-extern struct audio_driver coreaudio_audio_driver;
-extern struct audio_driver dsound_audio_driver;
-extern struct audio_driver esd_audio_driver;
-extern struct audio_driver pa_audio_driver;
-extern struct audio_driver winwave_audio_driver;
-extern struct mixeng_volume nominal_volume;
+extern const struct mixeng_volume nominal_volume;
+
+void audio_driver_register(audio_driver *drv);
+audio_driver *audio_driver_lookup(const char *name);
 
 void audio_pcm_init_info (struct audio_pcm_info *info, struct audsettings *as);
 void audio_pcm_info_clear_buf (struct audio_pcm_info *info, void *buf, int len);
@@ -242,12 +237,6 @@ static inline int audio_ring_dist (int dst, int src, int len)
     return (dst >= src) ? (dst - src) : (len - src + dst);
 }
 
-#if defined __GNUC__
-#define INIT_FIELD(f) . f
-#else
-#define INIT_FIELD(f) /**/
-#endif
-
 #define dolog(fmt, ...) AUD_log(AUDIO_CAP, fmt, ## __VA_ARGS__)
 
 #ifdef DEBUG
@@ -259,10 +248,4 @@ static inline int audio_ring_dist (int dst, int src, int len)
 #define AUDIO_STRINGIFY_(n) #n
 #define AUDIO_STRINGIFY(n) AUDIO_STRINGIFY_(n)
 
-#if defined _MSC_VER || defined __GNUC__
-#define AUDIO_FUNC __FUNCTION__
-#else
-#define AUDIO_FUNC __FILE__ ":" AUDIO_STRINGIFY (__LINE__)
-#endif
-
-#endif /* audio_int.h */
+#endif /* QEMU_AUDIO_INT_H */

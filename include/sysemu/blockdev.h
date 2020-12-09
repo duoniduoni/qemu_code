@@ -13,44 +13,54 @@
 #include "block/block.h"
 #include "qemu/queue.h"
 
-void blockdev_mark_auto_del(BlockDriverState *bs);
-void blockdev_auto_del(BlockDriverState *bs);
+void blockdev_mark_auto_del(BlockBackend *blk);
+void blockdev_auto_del(BlockBackend *blk);
 
-#define BLOCK_SERIAL_STRLEN 20
+typedef enum {
+    IF_DEFAULT = -1,            /* for use with drive_add() only */
+    /*
+     * IF_NONE must be zero, because we want MachineClass member
+     * block_default_type to default-initialize to IF_NONE
+     */
+    IF_NONE = 0,
+    IF_IDE, IF_SCSI, IF_FLOPPY, IF_PFLASH, IF_MTD, IF_SD, IF_VIRTIO, IF_XEN,
+    IF_COUNT
+} BlockInterfaceType;
 
 struct DriveInfo {
-    BlockDriverState *bdrv;
-    char *id;
     const char *devaddr;
     BlockInterfaceType type;
     int bus;
     int unit;
     int auto_del;               /* see blockdev_mark_auto_del() */
+    bool is_default;            /* Added by default_drive() ?  */
+    int media_cd;
+    int cyls, heads, secs, trans;
     QemuOpts *opts;
-    char serial[BLOCK_SERIAL_STRLEN + 1];
+    char *serial;
     QTAILQ_ENTRY(DriveInfo) next;
 };
 
-#define MAX_IDE_DEVS	2
-#define MAX_SCSI_DEVS	7
+DriveInfo *blk_legacy_dinfo(BlockBackend *blk);
+DriveInfo *blk_set_legacy_dinfo(BlockBackend *blk, DriveInfo *dinfo);
+BlockBackend *blk_by_legacy_dinfo(DriveInfo *dinfo);
 
-extern DriveInfo *drive_get(BlockInterfaceType type, int bus, int unit);
-extern int drive_get_max_bus(BlockInterfaceType type);
-extern void drive_uninit(DriveInfo *dinfo);
-extern DriveInfo *drive_get_by_blockdev(BlockDriverState *bs);
+void override_max_devs(BlockInterfaceType type, int max_devs);
 
-extern QemuOpts *drive_add(const char *file, const char *fmt, ...);
-extern DriveInfo *drive_init(QemuOpts *arg, int default_to_scsi,
-                             int *fatal_error);
+DriveInfo *drive_get(BlockInterfaceType type, int bus, int unit);
+void drive_check_orphaned(void);
+DriveInfo *drive_get_by_index(BlockInterfaceType type, int index);
+int drive_get_max_bus(BlockInterfaceType type);
+int drive_get_max_devs(BlockInterfaceType type);
+DriveInfo *drive_get_next(BlockInterfaceType type);
+
+QemuOpts *drive_def(const char *optstr);
+QemuOpts *drive_add(BlockInterfaceType type, int index, const char *file,
+                    const char *optstr);
+DriveInfo *drive_new(QemuOpts *arg, BlockInterfaceType block_default_type);
 
 /* device-hotplug */
 
-DriveInfo *add_init_drive(const char *opts);
-
-void do_commit(Monitor *mon, const QDict *qdict);
-int do_eject(Monitor *mon, const QDict *qdict, QObject **ret_data);
-int do_block_set_passwd(Monitor *mon, const QDict *qdict, QObject **ret_data);
-int do_change_block(Monitor *mon, const char *device,
-                    const char *filename, const char *fmt);
-
+void hmp_commit(Monitor *mon, const QDict *qdict);
+void hmp_drive_del(Monitor *mon, const QDict *qdict);
 #endif

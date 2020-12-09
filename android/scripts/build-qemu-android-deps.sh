@@ -80,22 +80,7 @@ aosp_dir_parse_option
 prebuilts_dir_parse_option
 install_dir_parse_option
 
-ARCHIVE_DIR=$PREBUILTS_DIR/archive
-if [ ! -d "$ARCHIVE_DIR" ]; then
-    dump "Downloading dependencies sources first."
-    $(program_directory)/download-sources.sh \
-        --verbosity=$(get_verbosity) \
-        --prebuilts-dir=$PREBUILTS_DIR
-fi
-ARCHIVE_DIR=$(cd "$ARCHIVE_DIR" && pwd -P)
-log "Using archive directory: $ARCHIVE_DIR"
-
-PACKAGE_LIST=$ARCHIVE_DIR/PACKAGES.TXT
-if [ ! -f "$PACKAGE_LIST" ]; then
-    panic "Missing package list file from archive: $PACKAGE_LIST"
-fi
-
-package_list_parse_file "$PACKAGE_LIST"
+package_builder_parse_package_list
 
 export PKG_CONFIG=$(find_program pkg-config)
 if [ "$PKG_CONFIG" ]; then
@@ -103,6 +88,21 @@ if [ "$PKG_CONFIG" ]; then
 else
     log "pkg-config is not installed on this system."
 fi
+
+display_darwin_warning() {
+  # Fancy colors
+  RED=`tput setaf 1`
+  RESET=`tput sgr0`
+  echo "${RED}"
+  dump "-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--=-=-"
+  dump "WARNING!! WARNING!! WARNING!! WARNING!! WARNING!! WARNING!!"
+  dump "Make sure you are compiling against the lowest supported SDK in"
+  dump "Newer SDKs might not be backwards compatible, possibly breaking"
+  dump "the build for other users"
+  dump "The mac you are building on must have this SDK installed!"
+  dump "-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--=-=-"
+  echo "${RESET}"
+}
 
 # Handle zlib, only on Win32 because the zlib configure script
 # doesn't know how to generate a static library with -fPIC!
@@ -124,7 +124,7 @@ do_windows_zlib_package () {
     ZLIB_VERSION=$(package_list_get_version zlib)
     dump "$(builder_text) Building zlib-$ZLIB_VERSION"
     ZLIB_PACKAGE=$(package_list_get_filename zlib)
-    unpack_archive "$ARCHIVE_DIR/$ZLIB_PACKAGE" "$BUILD_DIR"
+    unpack_archive "$(builder_archive_dir)/$ZLIB_PACKAGE" "$BUILD_DIR"
     (
         run cd "$BUILD_DIR/zlib-$ZLIB_VERSION" &&
         export BINARY_PATH=$PREFIX/bin &&
@@ -154,11 +154,11 @@ do_zlib_package () {
     ZLIB_VERSION=$(package_list_get_version zlib)
     dump "$(builder_text) Building zlib-$ZLIB_VERSION"
     ZLIB_PACKAGE=$(package_list_get_filename zlib)
-    unpack_archive "$ARCHIVE_DIR/$ZLIB_PACKAGE" "$BUILD_DIR"
+    unpack_archive "$(builder_archive_dir)/$ZLIB_PACKAGE" "$BUILD_DIR"
     (
         run cd "$BUILD_DIR/zlib-$ZLIB_VERSION" &&
         export CROSS_PREFIX=$(builder_gnu_config_host_prefix) &&
-        run ./configure --prefix=$(builder_install_prefix) &&
+        (export CFLAGS="-g -O3 -fPIC"; run ./configure --prefix=$(builder_install_prefix)) &&
         run make -j$NUM_JOBS &&
         run make install
     )
@@ -178,31 +178,8 @@ require_program () {
 # Unpack and patch GLib sources
 # $1: Unversioned package name (e.g. 'glib')
 unpack_and_patch () {
-    local PKG_NAME="$1"
-    local BUILD_DIR=$(builder_build_dir)
-    local PKG_VERSION PKG_PACKAGE PKG_PATCHES_DIR PKG_PATCHES_PACKAGE
-    local PKG_DIR PATCH
-    PKG_VERSION=$(package_list_get_version $PKG_NAME)
-    if [ -z "$PKG_VERSION" ]; then
-        panic "Cannot find version for package $PKG_NAME!"
-    fi
-    log "Extracting $PKG_NAME-$PKG_VERSION"
-    PKG_PACKAGE=$(package_list_get_filename $PKG_NAME)
-    unpack_archive "$ARCHIVE_DIR/$PKG_PACKAGE" "$BUILD_DIR" ||
-    panic "Could not unpack $PKG_NAME-$PKG_VERSION"
-    PKG_DIR=$BUILD_DIR/$PKG_NAME-$PKG_VERSION
-
-    PKG_PATCHES_DIR=$PKG_NAME-$PKG_VERSION-patches
-    PKG_PATCHES_PACKAGE=$ARCHIVE_DIR/${PKG_PATCHES_DIR}.tar.xz
-    if [ -f "$PKG_PATCHES_PACKAGE" ]; then
-        log "Patching $PKG_NAME-$PKG_VERSION"
-        unpack_archive "$PKG_PATCHES_PACKAGE" "$BUILD_DIR"
-        for PATCH in $(cd "$BUILD_DIR" && ls "$PKG_PATCHES_DIR"/*.patch); do
-            log "Applying patch: $PATCH"
-            (cd "$PKG_DIR" && run patch -p1 < "../$PATCH") ||
-                    panic "Could not apply $PATCH"
-        done
-    fi
+    package_list_unpack_and_patch \
+            $1 "$(builder_archive_dir)" "$(builder_build_dir)"
 }
 
 # Cross-compiling glib for Win32 is broken and requires special care.
@@ -211,7 +188,8 @@ unpack_and_patch () {
 do_windows_glib_package () {
     local PREFIX=$(builder_install_prefix)
     local GNU_CONFIG_HOST_PREFIX=$(builder_gnu_config_host_prefix)
-    unpack_and_patch glib
+    package_list_unpack_and_patch \
+            glib "$(builder_archive_dir)" "$(builder_build_dir)"
     local GLIB_VERSION GLIB_PACKAGE GLIB_DIR
     GLIB_VERSION=$(package_list_get_version glib)
     GLIB_DIR=$(builder_build_dir)/glib-$GLIB_VERSION
@@ -261,32 +239,19 @@ do_windows_glib_package () {
 # $1: package name, unversioned and unsuffixed (e.g. 'libpng')
 # $2+: extra configuration flags
 do_autotools_package () {
-    local PKG PKG_VERSION PKG_NAME
-    local PREFIX=$(builder_install_prefix)
-    PKG=$1
-    shift
-    unpack_and_patch $PKG
-    PKG_VERSION=$(package_list_get_version $PKG)
-    PKG_NAME=$(package_list_get_filename $PKG)
-    dump "$(builder_text) Building $PKG-$PKG_VERSION"
-    if [ $PKG == "SDL2" ]; then
-        unset SDKROOT
-    fi
-    (
-        run cd "$(builder_build_dir)/$PKG-$PKG_VERSION" &&
-        export LDFLAGS="-L$PREFIX/lib" &&
-        export CPPFLAGS="-I$PREFIX/include" &&
-        export PKG_CONFIG_LIBDIR="$PREFIX/lib/pkgconfig" &&
-        run ./configure \
-            --prefix=$PREFIX \
-            $(builder_gnu_config_host_flag) \
-            --disable-shared \
-            --with-pic \
-            "$@" &&
-        run make -j$NUM_JOBS V=1 &&
-        run make install V=1
-    ) ||
-    panic "Could not build and install $PKG_NAME"
+    # build position-independent code for non-Windows (Windows is always PIC)
+    local PIC_FLAG
+    case $(builder_host) in
+        windows-*)
+            PIC_FLAG=
+            ;;
+        *)
+            PIC_FLAG=--with-pic
+            ;;
+    esac
+
+    builder_unpack_package_source $1
+    builder_build_autotools_package "$@" --disable-shared $PIC_FLAG
 }
 
 do_dtc_package () {
@@ -335,6 +300,12 @@ build_qemu_android_deps () {
     local PREFIX=$(builder_install_prefix)
 
     export PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig
+    case $1 in
+        darwin-*)
+          display_darwin_warning
+          ;;
+    esac
+
     # Handle zlib for Windows
     case $1 in
         windows-*)
@@ -434,7 +405,15 @@ build_qemu_android_deps () {
         --disable-libpng
 
     # Handle SDL2
-    do_autotools_package SDL2
+    local SDL_FLAGS=
+    case $1 in
+        windows*)
+            # DirectX sources assume __FUNCTION__ is a macro, but on GCC it isn't.
+            SDL_FLAGS=--disable-directx
+            ;;
+    esac
+
+    do_autotools_package SDL2 $SDL_FLAGS
     SDL_CONFIG=$PREFIX/bin/sdl2-config
 
     # default sdl2.pc libs doesn't work with our cross-compiler,
@@ -442,6 +421,9 @@ build_qemu_android_deps () {
     case $1 in
         windows-*)
             sed -i -e '/^Libs: -L\${libdir} /s/$/ -Wl,--no-undefined -lm -ldinput8 -ldxguid -ldxerr8 -luser32 -lgdi32 -lwinmm -limm32 -lole32 -loleaut32 -lshell32 -lversion -luuid -static-libgcc/' $PREFIX/lib/pkgconfig/sdl2.pc
+            ;;
+        darwin-*)
+            sed -i "" -e '/^Libs: -L\${libdir} /s/$/ -lm -Wl,-framework,OpenGL  -Wl,-framework,ForceFeedback -lobjc -Wl,-framework,Cocoa -Wl,-framework,Carbon -Wl,-framework,IOKit -Wl,-framework,CoreAudio -Wl,-framework,AudioToolbox -Wl,-framework,AudioUnit/' $PREFIX/lib/pkgconfig/sdl2.pc
             ;;
         linux-*)
             sed -i -e '/^Libs: -L\${libdir} /s/$/ -Wl,--no-undefined -lm -ldl -lrt/' $PREFIX/lib/pkgconfig/sdl2.pc
@@ -498,63 +480,29 @@ EOF
     timestamp_set "$INSTALL_DIR/$(builder_host)" qemu-android-deps
 }
 
-# Perform a Darwin build through ssh to a remote machine.
-# $1: Darwin host name.
-# $2: List of darwin target systems to build for.
-do_remote_darwin_build () {
-    builder_prepare_remote_darwin_build \
-            "/tmp/$USER-rebuild-darwin-ssh-$$/qemu-android-deps-build"
-
-    copy_directory "$ARCHIVE_DIR" "$DARWIN_PKG_DIR"/archive
-
-    if [ "$OPT_FORCE" ]; then
-        var_append DARWIN_BUILD_FLAGS "--force"
-    fi
-    local PKG_DIR="$DARWIN_PKG_DIR"
-    local REMOTE_DIR=/tmp/$DARWIN_PKG_NAME
-    # Generate a script to rebuild all binaries from sources.
-    # Note that the use of the '-l' flag is important to ensure
-    # that this is run under a login shell. This ensures that
-    # ~/.bash_profile is sourced before running the script, which
-    # puts MacPorts' /opt/local/bin in the PATH properly.
-    #
-    # If not, the build is likely to fail with a cryptic error message
-    # like "readlink: illegal option -- f"
-    cat > $PKG_DIR/build.sh <<EOF
-#!/bin/bash -l
-PROGDIR=\$(dirname \$0)
-\$PROGDIR/scripts/$(program_name) \\
-    --build-dir=$REMOTE_DIR/build \\
-    --host=$(spaces_to_commas "$DARWIN_SYSTEMS") \\
-    --install-dir=$REMOTE_DIR/install-prefix \\
-    --prebuilts-dir=$REMOTE_DIR \\
-    --aosp-dir=$REMOTE_DIR/aosp \\
-    $DARWIN_BUILD_FLAGS
-EOF
-    builder_run_remote_darwin_build
-
-    local BINARY_DIR=$INSTALL_DIR
-    run mkdir -p "$BINARY_DIR" ||
-            panic "Could not create final directory: $BINARY_DIR"
-
-    for SYSTEM in $DARWIN_SYSTEMS; do
-        dump "[$SYSTEM] Retrieving remote darwin binaries"
-        run scp -r "$DARWIN_SSH":$REMOTE_DIR/install-prefix/$SYSTEM \
-                $BINARY_DIR/
-        timestamp_set "$INSTALL_DIR/$SYSTEM" qemu-android-deps
-    done
-
-}
-
 # Ignore prebuilt Darwin binaries if --force is not used.
 if [ -z "$OPT_FORCE" ]; then
     builder_check_all_timestamps "$INSTALL_DIR" qemu-android-deps
 fi
 
 if [ "$DARWIN_SSH" -a "$DARWIN_SYSTEMS" ]; then
+    # Let the people know that this is risky..
+    display_darwin_warning
+
     # Perform remote Darwin build first.
     dump "Remote qemu-android-deps build for: $DARWIN_SYSTEMS"
-    do_remote_darwin_build "$DARWIN_SSH" "$DARWIN_SYSTEMS"
+    builder_prepare_remote_darwin_build
+
+    if [ "$OPT_FORCE" ]; then
+        var_append DARWIN_BUILD_FLAGS "--force"
+    fi
+
+    builder_run_remote_darwin_build
+
+    for SYSTEM in $DARWIN_SYSTEMS; do
+        builder_remote_darwin_retrieve_install_dir $SYSTEM $INSTALL_DIR
+        timestamp_set "$INSTALL_DIR/$SYSTEM" qemu-android-deps
+    done
 fi
 
 for SYSTEM in $LOCAL_HOST_SYSTEMS; do

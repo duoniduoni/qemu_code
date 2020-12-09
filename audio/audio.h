@@ -21,12 +21,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+
 #ifndef QEMU_AUDIO_H
 #define QEMU_AUDIO_H
 
-#include "config-host.h"
 #include "qemu/queue.h"
-#include "qemu-common.h"  /* For QEMUTimer */
 
 typedef void (*audio_callback_fn) (void *opaque, int avail);
 
@@ -87,12 +86,8 @@ typedef struct QEMUAudioTimeStamp {
     uint64_t old_ts;
 } QEMUAudioTimeStamp;
 
-void AUD_vlog (const char *cap, const char *fmt, va_list ap);
-void AUD_log (const char *cap, const char *fmt, ...)
-#ifdef __GNUC__
-    __attribute__ ((__format__ (__printf__, 2, 3)))
-#endif
-    ;
+void AUD_vlog (const char *cap, const char *fmt, va_list ap) GCC_FMT_ATTR(2, 0);
+void AUD_log (const char *cap, const char *fmt, ...) GCC_FMT_ATTR(2, 3);
 
 void AUD_help (void);
 void AUD_register_card (const char *name, QEMUSoundCard *card);
@@ -144,7 +139,7 @@ uint64_t AUD_get_elapsed_usec_in (SWVoiceIn *sw, QEMUAudioTimeStamp *ts);
 
 static inline void *advance (void *p, int incr)
 {
-    uint8_t *d = p;
+    uint8_t *d = (uint8_t *)p;
     return (d + incr);
 }
 
@@ -168,13 +163,14 @@ static inline void *advance (void *p, int incr)
 int wav_start_capture (CaptureState *s, const char *path, int freq,
                        int bits, int nchannels);
 
-extern int
-audio_get_backend_count( int  is_input );
+bool audio_is_cleaning_up(void);
+void audio_cleanup(void);
 
-extern const char*
-audio_get_backend_name( int   is_input, int  index, const char*  *pinfo );
+void audio_sample_to_uint64(void *samples, int pos,
+                            uint64_t *left, uint64_t *right);
+void audio_sample_from_uint64(void *samples, int pos,
+                            uint64_t left, uint64_t right);
 
-extern int
-audio_check_backend_name( int  is_input, const char*  name );
+void set_audio_drv(const char* name);
 
-#endif  /* audio.h */
+#endif /* QEMU_AUDIO_H */

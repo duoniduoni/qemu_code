@@ -19,32 +19,11 @@
 shell_import utils/emulator_prebuilts.shi
 shell_import utils/option_parser.shi
 shell_import utils/package_list_parser.shi
+shell_import utils/temp_dir.shi
 
 ###
 ###  Utilities
 ###
-
-# Create temporary directory and ensure it is destroyed on script exit.
-_cleanup_temp_dir () {
-    rm -rf "$TEMP_DIR"
-    exit $1
-}
-
-_TEMP_DIR=
-
-# Return a temporary directory for this script. This creates the directory
-# lazily and ensures it is always destroyed on script exit.
-# Out: temporary directory path.
-temp_dir () {
-    if [ -z "$_TEMP_DIR" ]; then
-        _TEMP_DIR=/tmp/$USER-download-sources-temp-$$
-        silent_run mkdir -p "$_TEMP_DIR" || panic "Could not create temporary directory: $_TEMP_DIR"
-        # Ensure temporary directory is deleted on script exit
-        trap "_cleanup_temp_dir 0" EXIT
-        trap "_cleanup_temp_dir \$?" QUIT INT HUP
-    fi
-    printf %s "$_TEMP_DIR"
-}
 
 # Download a file.
 # $1: Source URL
@@ -126,7 +105,33 @@ git_clone_depth1 () {
         panic "Git destination directory already exists: $DST_DIR"
     fi
     run git clone --depth 1 --branch "$BRANCH" "$GIT_URL" "$DST_DIR" ||
+            panic "Could not clone (depth=1) git repository: $GIT_URL"
+}
+
+# Clone a git repository, and checkout a specific branch & commit.
+# $1: Source git URL.
+# $2: Destination directory.
+# $3: Branch / Commit
+git_clone () {
+    local GIT_URL DST_DIR BRANCH CHECK_REV
+    GIT_URL=$1
+    DST_DIR=$2
+    BRANCH=$3
+
+    if [ -d "$DST_DIR" ]; then
+        panic "Git destination directory already exists: $DST_DIR"
+    fi
+    run git clone "$GIT_URL" "$DST_DIR" ||
             panic "Could not clone git repository: $GIT_URL"
+    run git -C "$DST_DIR" checkout $BRANCH ||
+            panic "Could not checkout $GIT_URL - $BRANCH"
+}
+
+# Check if git branch exists in remote repository
+# $1: Source git URL.
+# $2: Branch Name
+git_remote_branch_exists () {
+    git ls-remote --exit-code "$1" "$2" > /dev/null
 }
 
 # Check out a SVN repository
@@ -187,16 +192,23 @@ Use the --prebuilts-dir=<path> option to change it to a new value, or
 alternatively, define the ANDROID_EMULATOR_PREBUILTS_DIR environment
 variable.
 
-If a package file is already in <prebuilts>/archive, the script checks its
-SHA-1 to avoid re-downloading it. You can however use --force to always
-download."
+It relies on a file listing all packages / git repositories, which is by
+default:
+
+    <prebuilts>/archive/PACKAGES.TXT
+
+You can provide another file with the --list=<file> option.
+
+If one of the listed file is not in <prebuilts>/archive it will be downloaded
+automatically. If the file is present, the script checks its SHA-1 to avoid
+re-downloading it. You can however use --force to always download."
 
 PROGRAM_PARAMETERS=""
 
 OPT_FORCE=
 option_register_var "--force" OPT_FORCE "Always download files."
 
-PACKAGE_LIST=$(program_directory)/../dependencies/PACKAGES.TXT
+PACKAGE_LIST=
 option_register_var "--list=<file>" PACKAGE_LIST "Specify package list file"
 
 prebuilts_dir_register_option
@@ -207,13 +219,16 @@ if [ "$PARAMETER_COUNT" != "0" ]; then
     panic "This script doesn't take arguments. See --help."
 fi
 
-if [ ! -f "$PACKAGE_LIST" ]; then
-    panic "Missing package list file: $PACKAGE_LIST"
+prebuilts_dir_parse_option
+
+if [ -z "$PACKAGE_LIST" ]; then
+    PACKAGE_LIST=$PREBUILTS_DIR/archive/PACKAGES.TXT
+    if [ ! -f "$PACKAGE_LIST" ]; then
+        panic "Missing package list file, use --list=<file>: $PACKAGE_LIST"
+    fi
 fi
 
 PACKAGE_DIR=$(dirname "$PACKAGE_LIST")
-
-prebuilts_dir_parse_option
 
 ###
 ###  Do the work.
@@ -274,12 +289,16 @@ for PACKAGE in $(package_list_get_packages); do
         elif [ "$PKG_GIT" ]; then
             PKG_FILE=$(package_list_get_full_name $PACKAGE)
             PKG_BRANCH=$(package_list_get_version $PACKAGE)
-            dump "Cloning $PKG_GIT"
-            TEMP_DIR=$(temp_dir)
+            dump "Cloning $PKG_GIT - $PKG_BRANCH"
+            var_create_temp_dir TEMP_DIR download-sources-temp
             if [ -d "$TEMP_DIR/$PKG_FILE" ]; then
                 run rm -rf "$TEMP_DIR/$PKG_FILE"
             fi
-            git_clone_depth1 "$PKG_GIT" "$TEMP_DIR/$PKG_FILE" "$PKG_BRANCH"
+            if git_remote_branch_exists "$PKG_GIT" "$PKG_BRANCH" ; then
+                git_clone_depth1 "$PKG_GIT" "$TEMP_DIR/$PKG_FILE" "$PKG_BRANCH"
+            else
+                git_clone "$PKG_GIT" "$TEMP_DIR/$PKG_FILE" "$PKG_BRANCH"
+            fi
             run rm -rf "$TEMP_DIR/$PKG_FILE"/.git*
             create_sorted_tar_archive "$ARCHIVE_DIR"/$PKG_FILE.tar.xz \
                     "$TEMP_DIR/$PKG_FILE"
@@ -316,21 +335,19 @@ for PACKAGE in $(package_list_get_packages); do
         fi
     fi
 
-    # Copy patches file if any.
+    # Check patches file if any.
     PKG_PATCHES=$(package_list_get_patches $PACKAGE)
     if [ "$PKG_PATCHES" ]; then
-        PKG_PATCHES_SRC=$PACKAGE_DIR/$PKG_PATCHES
-        PKG_PATCHES_DST=$ARCHIVE_DIR/$(basename "$PKG_PATCHES")
-        dump "Copying patches file: $PKG_PATCHES_DST"
-        if [ ! -f "$PKG_PATCHES_SRC" ]; then
-            panic "Missing patches file from line $COUNT: $PKG_PATCHES_SRC"
+        PKG_PATCHES_FILE=$ARCHIVE_DIR/$PKG_PATCHES
+        dump "Checking patch file   : $PKG_PATCHES_FILE"
+        if [ ! -f "$PKG_PATCHES_FILE" ]; then
+            panic "Missing patches file from line $COUNT: $PKG_PATCHES_FILE"
         fi
-        run mkdir -p $(dirname "$PKG_PATCHES_DST") &&
-        run cp -f "$PKG_PATCHES_SRC" "$PKG_PATCHES_DST" ||
-                panic "Could not copy: $PKG_PATCHES_SRC to $PKG_PATCHES_DST"
     fi
 done
 
-run cp -f "$PACKAGE_LIST" "$ARCHIVE_DIR"/PACKAGES.TXT
+if [ "$PACKAGE_DIR" != "$ARCHIVE_DIR" ]; then
+    run cp -f "$PACKAGE_LIST" "$ARCHIVE_DIR"/PACKAGES.TXT
+fi
 
 dump "Done."

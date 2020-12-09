@@ -25,17 +25,12 @@
  * THE SOFTWARE.
  */
 
-#ifndef _QEMU_OPTIONS_H_
-#define _QEMU_OPTIONS_H_
+#ifndef QEMU_OPTIONS_H
+#define QEMU_OPTIONS_H
 
 enum {
-#define DEF(option, opt_arg, opt_enum, opt_help)     \
-    opt_enum,
-#define DEFHEADING(text)
-#include "qemu-options.def"
-#undef DEF
-#undef DEFHEADING
-#undef GEN_DOCS
+#define QEMU_OPTIONS_GENERATE_ENUM
+#include "qemu-options-wrapper.h"
 };
 
 #endif

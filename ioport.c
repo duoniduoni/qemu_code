@@ -25,213 +25,276 @@
  * splitted out ioport related stuffs from vl.c.
  */
 
+#include "qemu/osdep.h"
+#include "qemu-common.h"
+#include "cpu.h"
 #include "exec/ioport.h"
+#include "trace-root.h"
+#include "exec/memory.h"
+#include "exec/address-spaces.h"
 
-/***********************************************************/
-/* IO Port */
+typedef struct MemoryRegionPortioList {
+    MemoryRegion mr;
+    void *portio_opaque;
+    MemoryRegionPortio ports[];
+} MemoryRegionPortioList;
 
-//#define DEBUG_UNUSED_IOPORT
-//#define DEBUG_IOPORT
-
-#ifdef DEBUG_UNUSED_IOPORT
-#  define LOG_UNUSED_IOPORT(fmt, ...) fprintf(stderr, fmt, ## __VA_ARGS__)
-#else
-#  define LOG_UNUSED_IOPORT(fmt, ...) do{ } while (0)
-#endif
-
-#ifdef DEBUG_IOPORT
-#  define LOG_IOPORT(...) qemu_log_mask(CPU_LOG_IOPORT, ## __VA_ARGS__)
-#else
-#  define LOG_IOPORT(...) do { } while (0)
-#endif
-
-/* XXX: use a two level table to limit memory usage */
-
-static void *ioport_opaque[MAX_IOPORTS];
-static IOPortReadFunc *ioport_read_table[3][MAX_IOPORTS];
-static IOPortWriteFunc *ioport_write_table[3][MAX_IOPORTS];
-
-static IOPortReadFunc default_ioport_readb, default_ioport_readw, default_ioport_readl;
-static IOPortWriteFunc default_ioport_writeb, default_ioport_writew, default_ioport_writel;
-
-static uint32_t ioport_read(int index, uint32_t address)
+static uint64_t unassigned_io_read(void *opaque, hwaddr addr, unsigned size)
 {
-    static IOPortReadFunc * const default_func[3] = {
-        default_ioport_readb,
-        default_ioport_readw,
-        default_ioport_readl
-    };
-    IOPortReadFunc *func = ioport_read_table[index][address];
-    if (!func)
-        func = default_func[index];
-    return func(ioport_opaque[address], address);
+    return -1ULL;
 }
 
-static void ioport_write(int index, uint32_t address, uint32_t data)
+static void unassigned_io_write(void *opaque, hwaddr addr, uint64_t val,
+                                unsigned size)
 {
-    static IOPortWriteFunc * const default_func[3] = {
-        default_ioport_writeb,
-        default_ioport_writew,
-        default_ioport_writel
-    };
-    IOPortWriteFunc *func = ioport_write_table[index][address];
-    if (!func)
-        func = default_func[index];
-    func(ioport_opaque[address], address, data);
 }
 
-static uint32_t default_ioport_readb(void *opaque, uint32_t address)
+const MemoryRegionOps unassigned_io_ops = {
+    .read = unassigned_io_read,
+    .write = unassigned_io_write,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+void cpu_outb(uint32_t addr, uint8_t val)
 {
-    LOG_UNUSED_IOPORT("unused inb: port=0x%04"PRIx32"\n", address);
-    return 0xff;
+    trace_cpu_out(addr, 'b', val);
+    address_space_write(&address_space_io, addr, MEMTXATTRS_UNSPECIFIED,
+                        &val, 1);
 }
 
-static void default_ioport_writeb(void *opaque, uint32_t address, uint32_t data)
+void cpu_outw(uint32_t addr, uint16_t val)
 {
-    LOG_UNUSED_IOPORT("unused outb: port=0x%04"PRIx32" data=0x%02"PRIx32"\n",
-                      address, data);
+    uint8_t buf[2];
+
+    trace_cpu_out(addr, 'w', val);
+    stw_p(buf, val);
+    address_space_write(&address_space_io, addr, MEMTXATTRS_UNSPECIFIED,
+                        buf, 2);
 }
 
-/* default is to make two byte accesses */
-static uint32_t default_ioport_readw(void *opaque, uint32_t address)
+void cpu_outl(uint32_t addr, uint32_t val)
 {
-    uint32_t data;
-    data = ioport_read(0, address);
-    address = (address + 1) & IOPORTS_MASK;
-    data |= ioport_read(0, address) << 8;
+    uint8_t buf[4];
+
+    trace_cpu_out(addr, 'l', val);
+    stl_p(buf, val);
+    address_space_write(&address_space_io, addr, MEMTXATTRS_UNSPECIFIED,
+                        buf, 4);
+}
+
+uint8_t cpu_inb(uint32_t addr)
+{
+    uint8_t val;
+
+    address_space_read(&address_space_io, addr, MEMTXATTRS_UNSPECIFIED,
+                       &val, 1);
+    trace_cpu_in(addr, 'b', val);
+    return val;
+}
+
+uint16_t cpu_inw(uint32_t addr)
+{
+    uint8_t buf[2];
+    uint16_t val;
+
+    address_space_read(&address_space_io, addr, MEMTXATTRS_UNSPECIFIED, buf, 2);
+    val = lduw_p(buf);
+    trace_cpu_in(addr, 'w', val);
+    return val;
+}
+
+uint32_t cpu_inl(uint32_t addr)
+{
+    uint8_t buf[4];
+    uint32_t val;
+
+    address_space_read(&address_space_io, addr, MEMTXATTRS_UNSPECIFIED, buf, 4);
+    val = ldl_p(buf);
+    trace_cpu_in(addr, 'l', val);
+    return val;
+}
+
+void portio_list_init(PortioList *piolist,
+                      Object *owner,
+                      const MemoryRegionPortio *callbacks,
+                      void *opaque, const char *name)
+{
+    unsigned n = 0;
+
+    while (callbacks[n].size) {
+        ++n;
+    }
+
+    piolist->ports = callbacks;
+    piolist->nr = 0;
+    piolist->regions = g_new0(MemoryRegion *, n);
+    piolist->address_space = NULL;
+    piolist->opaque = opaque;
+    piolist->owner = owner;
+    piolist->name = name;
+    piolist->flush_coalesced_mmio = false;
+}
+
+void portio_list_set_flush_coalesced(PortioList *piolist)
+{
+    piolist->flush_coalesced_mmio = true;
+}
+
+void portio_list_destroy(PortioList *piolist)
+{
+    MemoryRegionPortioList *mrpio;
+    unsigned i;
+
+    for (i = 0; i < piolist->nr; ++i) {
+        mrpio = container_of(piolist->regions[i], MemoryRegionPortioList, mr);
+        object_unparent(OBJECT(&mrpio->mr));
+        g_free(mrpio);
+    }
+    g_free(piolist->regions);
+}
+
+static const MemoryRegionPortio *find_portio(MemoryRegionPortioList *mrpio,
+                                             uint64_t offset, unsigned size,
+                                             bool write)
+{
+    const MemoryRegionPortio *mrp;
+
+    for (mrp = mrpio->ports; mrp->size; ++mrp) {
+        if (offset >= mrp->offset && offset < mrp->offset + mrp->len &&
+            size == mrp->size &&
+            (write ? (bool)mrp->write : (bool)mrp->read)) {
+            return mrp;
+        }
+    }
+    return NULL;
+}
+
+static uint64_t portio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    MemoryRegionPortioList *mrpio = opaque;
+    const MemoryRegionPortio *mrp = find_portio(mrpio, addr, size, false);
+    uint64_t data;
+
+    data = ((uint64_t)1 << (size * 8)) - 1;
+    if (mrp) {
+        data = mrp->read(mrpio->portio_opaque, mrp->base + addr);
+    } else if (size == 2) {
+        mrp = find_portio(mrpio, addr, 1, false);
+        if (mrp) {
+            data = mrp->read(mrpio->portio_opaque, mrp->base + addr);
+            if (addr + 1 < mrp->offset + mrp->len) {
+                data |= mrp->read(mrpio->portio_opaque, mrp->base + addr + 1) << 8;
+            } else {
+                data |= 0xff00;
+            }
+        }
+    }
     return data;
 }
 
-static void default_ioport_writew(void *opaque, uint32_t address, uint32_t data)
+static void portio_write(void *opaque, hwaddr addr, uint64_t data,
+                         unsigned size)
 {
-    ioport_write(0, address, data & 0xff);
-    address = (address + 1) & IOPORTS_MASK;
-    ioport_write(0, address, (data >> 8) & 0xff);
-}
+    MemoryRegionPortioList *mrpio = opaque;
+    const MemoryRegionPortio *mrp = find_portio(mrpio, addr, size, true);
 
-static uint32_t default_ioport_readl(void *opaque, uint32_t address)
-{
-    LOG_UNUSED_IOPORT("unused inl: port=0x%04"PRIx32"\n", address);
-    return 0xffffffff;
-}
-
-static void default_ioport_writel(void *opaque, uint32_t address, uint32_t data)
-{
-    LOG_UNUSED_IOPORT("unused outl: port=0x%04"PRIx32" data=0x%02"PRIx32"\n",
-                      address, data);
-}
-
-static int ioport_bsize(int size, int *bsize)
-{
-    if (size == 1) {
-        *bsize = 0;
+    if (mrp) {
+        mrp->write(mrpio->portio_opaque, mrp->base + addr, data);
     } else if (size == 2) {
-        *bsize = 1;
-    } else if (size == 4) {
-        *bsize = 2;
-    } else {
-        return -1;
-    }
-    return 0;
-}
-
-/* size is the word size in byte */
-int register_ioport_read(pio_addr_t start, int length, int size,
-                         IOPortReadFunc *func, void *opaque)
-{
-    pio_addr_t i;
-    int bsize;
-
-    if (ioport_bsize(size, &bsize)) {
-        hw_error("register_ioport_read: invalid size");
-        return -1;
-    }
-    for(i = start; i < start + length; i += size) {
-        ioport_read_table[bsize][i] = func;
-        if (ioport_opaque[i] != NULL && ioport_opaque[i] != opaque)
-            hw_error("register_ioport_read: invalid opaque");
-        ioport_opaque[i] = opaque;
-    }
-    return 0;
-}
-
-/* size is the word size in byte */
-int register_ioport_write(pio_addr_t start, int length, int size,
-                          IOPortWriteFunc *func, void *opaque)
-{
-    pio_addr_t i;
-    int bsize;
-
-    if (ioport_bsize(size, &bsize)) {
-        hw_error("register_ioport_write: invalid size");
-        return -1;
-    }
-    for(i = start; i < start + length; i += size) {
-        ioport_write_table[bsize][i] = func;
-        if (ioport_opaque[i] != NULL && ioport_opaque[i] != opaque)
-            hw_error("register_ioport_write: invalid opaque");
-        ioport_opaque[i] = opaque;
-    }
-    return 0;
-}
-
-void isa_unassign_ioport(pio_addr_t start, int length)
-{
-    pio_addr_t i;
-
-    for(i = start; i < start + length; i++) {
-        ioport_read_table[0][i] = default_ioport_readb;
-        ioport_read_table[1][i] = default_ioport_readw;
-        ioport_read_table[2][i] = default_ioport_readl;
-
-        ioport_write_table[0][i] = default_ioport_writeb;
-        ioport_write_table[1][i] = default_ioport_writew;
-        ioport_write_table[2][i] = default_ioport_writel;
-
-        ioport_opaque[i] = NULL;
+        mrp = find_portio(mrpio, addr, 1, true);
+        if (mrp) {
+            mrp->write(mrpio->portio_opaque, mrp->base + addr, data & 0xff);
+            if (addr + 1 < mrp->offset + mrp->len) {
+                mrp->write(mrpio->portio_opaque, mrp->base + addr + 1, data >> 8);
+            }
+        }
     }
 }
 
-/***********************************************************/
+static const MemoryRegionOps portio_ops = {
+    .read = portio_read,
+    .write = portio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid.unaligned = true,
+    .impl.unaligned = true,
+};
 
-void cpu_outb(pio_addr_t addr, uint8_t val)
+static void portio_list_add_1(PortioList *piolist,
+                              const MemoryRegionPortio *pio_init,
+                              unsigned count, unsigned start,
+                              unsigned off_low, unsigned off_high)
 {
-    LOG_IOPORT("outb: %04"FMT_pioaddr" %02"PRIx8"\n", addr, val);
-    ioport_write(0, addr, val);
+    MemoryRegionPortioList *mrpio;
+    unsigned i;
+
+    /* Copy the sub-list and null-terminate it.  */
+    mrpio = g_malloc0(sizeof(MemoryRegionPortioList) +
+                      sizeof(MemoryRegionPortio) * (count + 1));
+    mrpio->portio_opaque = piolist->opaque;
+    memcpy(mrpio->ports, pio_init, sizeof(MemoryRegionPortio) * count);
+    memset(mrpio->ports + count, 0, sizeof(MemoryRegionPortio));
+
+    /* Adjust the offsets to all be zero-based for the region.  */
+    for (i = 0; i < count; ++i) {
+        mrpio->ports[i].offset -= off_low;
+        mrpio->ports[i].base = start + off_low;
+    }
+
+    memory_region_init_io(&mrpio->mr, piolist->owner, &portio_ops, mrpio,
+                          piolist->name, off_high - off_low);
+    if (piolist->flush_coalesced_mmio) {
+        memory_region_set_flush_coalesced(&mrpio->mr);
+    }
+    memory_region_add_subregion(piolist->address_space,
+                                start + off_low, &mrpio->mr);
+    piolist->regions[piolist->nr] = &mrpio->mr;
+    ++piolist->nr;
 }
 
-void cpu_outw(pio_addr_t addr, uint16_t val)
+void portio_list_add(PortioList *piolist,
+                     MemoryRegion *address_space,
+                     uint32_t start)
 {
-    LOG_IOPORT("outw: %04"FMT_pioaddr" %04"PRIx16"\n", addr, val);
-    ioport_write(1, addr, val);
+    const MemoryRegionPortio *pio, *pio_start = piolist->ports;
+    unsigned int off_low, off_high, off_last, count;
+
+    piolist->address_space = address_space;
+
+    /* Handle the first entry specially.  */
+    off_last = off_low = pio_start->offset;
+    off_high = off_low + pio_start->len + pio_start->size - 1;
+    count = 1;
+
+    for (pio = pio_start + 1; pio->size != 0; pio++, count++) {
+        /* All entries must be sorted by offset.  */
+        assert(pio->offset >= off_last);
+        off_last = pio->offset;
+
+        /* If we see a hole, break the region.  */
+        if (off_last > off_high) {
+            portio_list_add_1(piolist, pio_start, count, start, off_low,
+                              off_high);
+            /* ... and start collecting anew.  */
+            pio_start = pio;
+            off_low = off_last;
+            off_high = off_low + pio->len + pio_start->size - 1;
+            count = 0;
+        } else if (off_last + pio->len > off_high) {
+            off_high = off_last + pio->len + pio_start->size - 1;
+        }
+    }
+
+    /* There will always be an open sub-list.  */
+    portio_list_add_1(piolist, pio_start, count, start, off_low, off_high);
 }
 
-void cpu_outl(pio_addr_t addr, uint32_t val)
+void portio_list_del(PortioList *piolist)
 {
-    LOG_IOPORT("outl: %04"FMT_pioaddr" %08"PRIx32"\n", addr, val);
-    ioport_write(2, addr, val);
-}
+    MemoryRegionPortioList *mrpio;
+    unsigned i;
 
-uint8_t cpu_inb(pio_addr_t addr)
-{
-    uint8_t val;
-    val = ioport_read(0, addr);
-    LOG_IOPORT("inb : %04"FMT_pioaddr" %02"PRIx8"\n", addr, val);
-    return val;
-}
-
-uint16_t cpu_inw(pio_addr_t addr)
-{
-    uint16_t val;
-    val = ioport_read(1, addr);
-    LOG_IOPORT("inw : %04"FMT_pioaddr" %04"PRIx16"\n", addr, val);
-    return val;
-}
-
-uint32_t cpu_inl(pio_addr_t addr)
-{
-    uint32_t val;
-    val = ioport_read(2, addr);
-    LOG_IOPORT("inl : %04"FMT_pioaddr" %08"PRIx32"\n", addr, val);
-    return val;
+    for (i = 0; i < piolist->nr; ++i) {
+        mrpio = container_of(piolist->regions[i], MemoryRegionPortioList, mr);
+        memory_region_del_subregion(piolist->address_space, &mrpio->mr);
+    }
 }

@@ -28,17 +28,14 @@ DEFAULT_INSTALL_SUBDIR=qemu-android
 PROGRAM_PARAMETERS="<qemu-android>"
 
 PROGRAM_DESCRIPTION=\
-"Build qemu-android binaries if needed. This script probes
-<prebuilts>/$DEFAULT_INSTALL_SUBDIR/ and will rebuild the programs from sources
-if they are not available.
+"Build upstream version of qemu-android sources (*without* Android support).
+This script will probe <prebuilts>/$DEFAULT_INSTALL_SUBDIR/ to look for
+prebuilt dependencies. If not available, the 'build-qemu-android-deps.sh'
+script will be invoked automatically.
 
 The default value of <prebuilts> is: $DEFAULT_PREBUILTS_DIR
 Use --prebuilts-dir=<path> or define ANDROID_EMULATOR_PREBUILTS_DIR in your
 environment to change it.
-
-Prebuilt dependency libraries are probed under <prebuilts>/$DEFAULT_INSTALL_DIR/
-too. If not available, the 'build-qemu-android-deps.sh' script will be
-invoked automatically.
 
 Similarly, the script will try to auto-detect the AOSP source tree, to use
 prebuilt SDK-compatible toolchains, but you can use --aosp-dir=<path> or
@@ -62,7 +59,7 @@ allowing one to inspect build failures easily."
 package_builder_register_options
 
 VALID_TARGETS="arm,arm64,x86,x86_64,mips,mips64"
-DEFAULT_TARGETS="arm64,mips64"
+DEFAULT_TARGETS="arm,arm64,mips,mips64,x86,x86_64"
 
 OPT_TARGET=
 option_register_var "--target=<list>" OPT_TARGET \
@@ -70,7 +67,15 @@ option_register_var "--target=<list>" OPT_TARGET \
 
 OPT_SRC_DIR=
 option_register_var "--src-dir=<dir>" OPT_SRC_DIR \
-        "Set qemu-android source directory [autodetect]"
+        "Set qemu2 source directory [autodetect]"
+
+OPT_DEBUG=
+option_register_var "--debug" OPT_DEBUG \
+        "Generate debuggable binaries."
+
+OPT_TESTS=
+option_register_var "--tests" OPT_TESTS \
+        "Build and run QEMU2 tests."
 
 prebuilts_dir_register_option
 aosp_dir_register_option
@@ -83,20 +88,20 @@ if [ "$PARAMETER_COUNT" != 0 ]; then
 fi
 
 if [ "$OPT_SRC_DIR" ]; then
-    QEMU_ANDROID=$OPT_SRC_DIR
+    QEMU_SRCDIR=$OPT_SRC_DIR
 else
-    DEFAULT_SRC_DIR=$(cd $(program_directory)/../../../qemu-android && pwd -P 2>/dev/null || true)
+    DEFAULT_SRC_DIR=$(cd $(program_directory)/../.. && pwd -P 2>/dev/null || true)
     if [ "$DEFAULT_SRC_DIR" ]; then
-        QEMU_ANDROID=$DEFAULT_SRC_DIR
-        log "Auto-config: --src-dir=$QEMU_ANDROID"
+        QEMU_SRCDIR=$DEFAULT_SRC_DIR
+        log "Auto-config: --src-dir=$QEMU_SRCDIR"
     else
         panic "Could not find qemu-android sources. Please use --src-dir=<dir>."
     fi
 fi
-if [ ! -f "$QEMU_ANDROID/include/qemu-common.h" ]; then
-    panic "Not a valid qemu-android source directory: $QEMU_ANDROID"
+if [ ! -f "$QEMU_SRCDIR/include/qemu-common.h" ]; then
+    panic "Not a valid qemu2 source directory: $QEMU_SRCDIR"
 fi
-QEMU_ANDROID=$(cd "$QEMU_ANDROID" && pwd -P)
+QEMU_SRCDIR=$(cd "$QEMU_SRCDIR" && pwd -P)
 
 prebuilts_dir_parse_option
 aosp_dir_parse_option
@@ -105,6 +110,12 @@ install_dir_parse_option
 package_builder_process_options qemu-android
 
 QEMU_ANDROID_DEPS_INSTALL_DIR=$PREBUILTS_DIR/qemu-android-deps
+
+if [ -z "$OPT_INSTALL_DIR" ]; then
+    # The default installation directory for --no-android binaries is
+    # 'qemu-upstream' instead of 'qemu-android'
+    INSTALL_DIR=${INSTALL_DIR%%-android}-upstream
+fi
 
 ##
 ## Handle target system list
@@ -146,6 +157,20 @@ $(program_directory)/build-qemu-android-deps.sh \
     $EXTRA_FLAGS \
         || panic "could not check or rebuild qemu-android dependencies."
 
+display_darwin_warning() {
+  # Fancy colors
+  RED=`tput setaf 1`
+  RESET=`tput sgr0`
+  echo "${RED}"
+  dump "-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--=-=-"
+  dump "WARNING!! WARNING!! WARNING!! WARNING!! WARNING!! WARNING!!"
+  dump "Make sure the mac you are building on DOES not have any"
+  dump "libraries installed that are not found on a clean factory mac."
+  dump "For example homebrew with gcrypt, or a private openssl library"
+  dump "or anything else for that matter."
+  dump "-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=-=--=-=-"
+  echo "${RESET}"
+}
 # Local build of qemu-android binaries.
 # $1: host os name.
 # $2: AOSP source directory
@@ -189,6 +214,10 @@ build_qemu_android () {
         if [ "$(get_verbosity)" -gt 3 ]; then
             var_append BUILD_FLAGS "V=1"
         fi
+
+        # Generate LINK-* files that will be used to generate build files
+        # for the emulator build system.
+        LINKPROG_FLAGS="LINKPROG=$BUILD_DIR/link-prog AR=$BUILD_DIR/ar-prog"
 
         run mkdir -p "$BUILD_DIR"
         run rm -rf "$BUILD_DIR"/*
@@ -234,18 +263,41 @@ build_qemu_android () {
                 AUDIO_BACKENDS_FLAG="--audio-drv-list=pa"
                 ;;
             windows-*)
-                # Prefer winaudio on Windows because winwave causes
-                # major problems when audio input is enabled
-                AUDIO_BACKENDS_FLAG="--audio-drv-list=winaudio,winwave"
+                # Prefer winaudio on Windows over dsound.
+                AUDIO_BACKENDS_FLAG="--audio-drv-list=winaudio,dsound"
                 ;;
         esac
+
+        WHPX_FLAG=
+        case $1 in
+            windows-*)
+                # Windows Hypervisor Platform accelerator will only be needed
+                # on Windows.
+                WHPX_FLAG="--enable-whpx"
+                ;;
+            *)
+                WHPX_FLAG="--disable-whpx"
+                ;;
+        esac
+
+        LIBUSB_FLAGS=
+        case $1 in
+            windows-*)
+                # Libusb support on windows is not what we would like it to be
+                LIBUSB_FLAGS="--disable-libusb --disable-usb-redir"
+                ;;
+            *)
+                LIBUSB_FLAGS="--enable-libusb --enable-usb-redir"
+                ;;
+        esac
+
 
         PKG_CONFIG_PATH=$PREFIX/lib/pkgconfig
         PKG_CONFIG_LIBDIR=$PREFIX/lib/pkgconfig
         case $1 in
             windows-*)
                 # Use the host version, or the build will freeze.
-                PKG_CONFIG=pkg-config
+                PKG_CONFIG=`which pkg-config`
                 ;;
             *)
                 PKG_CONFIG=$PREFIX/bin/pkg-config
@@ -269,42 +321,125 @@ EOF
         case $BUILD_OS in
             darwin)
                 GLIB_LIBS="$GLIB_LIBS -Wl,-framework,Carbon -Wl,-framework,Foundation"
-                ;;
         esac
+
+        case $1 in
+          darwin*)
+            GCC=g++
+            ;;
+          linux*)
+            GCC=gcc
+            ;;
+          windows*)
+            GCC=g++
+            ;;
+        esac
+
+        # Create a linking program that will capture its command-line to a file.
+        cat > link-prog <<EOF
+#!/bin/sh
+
+# Extract target file.
+seen_o=
+target=
+for opt; do
+    if [ "\$opt" = "-o" ]; then
+      seen_o=true
+    elif [ "\$seen_o" ]; then
+      target=\$opt
+      seen_o=
+    fi
+done
+
+if [ "\$target" ]; then
+  dest=$BUILD_DIR/LINK-\$target
+  mkdir -p \$(dirname \$dest)
+  printf "%s\n" "\$@" > $BUILD_DIR/LINK-\$target
+fi
+$(builder_gnu_config_host_prefix)$GCC "\$@"
+EOF
+        chmod a+x link-prog
+
+        # Create an archiver program that will capture its command-line to a file.
+        cat > ar-prog <<EOF
+#!/bin/sh
+
+# Extract target file.
+seen_rcs=
+target=
+for opt; do
+    if [ "\$opt" = "rcs" ]; then
+      seen_rcs=true
+    elif [ "\$seen_rcs" ]; then
+      target=\$opt
+      seen_rcs=
+    fi
+done
+
+if [ "\$target" ]; then
+  dest=$BUILD_DIR/LINK-\$target
+  mkdir -p \$(dirname \$dest)
+  printf "%s\n" "\$@" > $BUILD_DIR/LINK-\$target
+fi
+$(builder_gnu_config_host_prefix)ar "\$@"
+EOF
+        chmod a+x ar-prog
 
         SDL_CONFIG=$PREFIX/bin/sdl2-config
         export SDL_CONFIG
 
-        run $QEMU_ANDROID/configure \
+        DEBUG_FLAGS=
+        if [ "$OPT_DEBUG" ]; then
+            DEBUG_FLAGS="--enable-debug"
+        fi
+
+        run $QEMU_SRCDIR/configure \
             $CROSS_PREFIX_FLAG \
             --target-list="$QEMU_TARGET_LIST" \
             --prefix=$PREFIX \
             --extra-cflags="$EXTRA_CFLAGS" \
             --extra-ldflags="$EXTRA_LDFLAGS" \
+            $DEBUG_FLAGS \
+            $LIBUSB_FLAGS \
             $AUDIO_BACKENDS_FLAG \
+            $WHPX_FLAG \
             --disable-attr \
+            --disable-bluez \
+            --disable-brlapi \
             --disable-blobs \
+            --disable-bzip2 \
             --disable-cap-ng \
+            --disable-capstone \
+            --disable-cocoa \
             --disable-curl \
             --disable-curses \
             --disable-docs \
             --disable-glusterfs \
             --disable-gtk \
             --disable-guest-agent \
-            --disable-libnfs \
+            --disable-guest-agent-msi \
             --disable-libiscsi \
+            --disable-jemalloc \
+            --disable-libnfs \
             --disable-libssh2 \
-            --disable-libusb \
-            --disable-quorum \
             --disable-seccomp \
+            --disable-smartcard \
             --disable-spice \
-            --disable-smartcard-nss \
+            --disable-tools \
             --disable-usb-redir \
             --disable-user \
             --disable-vde \
-            --disable-vhdx \
+            --disable-vte \
+            --disable-vxhs \
             --disable-vhost-net \
+            --disable-vnc-sasl \
             --disable-werror \
+            --disable-xen \
+            --disable-xen-pci-passthrough \
+            --disable-xfsctl \
+            --enable-sdl \
+            --enable-trace-backends=nop \
+            --enable-vnc \
             --with-sdlabi=2.0 \
             &&
 
@@ -324,7 +459,7 @@ EOF
             esac
 
             # Now build everything else in parallel.
-            run make -j$NUM_JOBS $BUILD_FLAGS
+            run make -j$NUM_JOBS $BUILD_FLAGS $LINKPROG_FLAGS V=1
 
             for QEMU_EXE in $QEMU_TARGET_BUILDS; do
                 if [ ! -f "$QEMU_EXE" ]; then
@@ -332,11 +467,22 @@ EOF
                 fi
             done
 
+            if [ -n "$OPT_TESTS" ]; then
+                if ! run make -j$NUM_JOBS $BUILD_FLAGS check GTESTER_FLAGS="-m quick -k"
+                then
+                    panic "$(builder_text) Failure when running qemu2 unittests!!"
+                fi
+            fi
+
     ) || panic "Build failed!!"
 
     BINARY_DIR=$INSTALL_DIR/$1
     run mkdir -p "$BINARY_DIR" ||
     panic "Could not create final directory: $BINARY_DIR"
+
+    run cp -p \
+        "$BUILD_DIR"/config-host.h \
+        "$BINARY_DIR"/config-host.h
 
     for QEMU_TARGET in $QEMU_TARGETS; do
         QEMU_EXE=qemu-system-${QEMU_TARGET}$(builder_host_exe_extension)
@@ -346,9 +492,25 @@ EOF
             "$BUILD_DIR"/$QEMU_TARGET-softmmu/$QEMU_EXE \
             "$BINARY_DIR"/$QEMU_EXE
 
+        mkdir -p "$BINARY_DIR"/$QEMU_TARGET-softmmu
+
+        run cp -p \
+            "$BUILD_DIR"/$QEMU_TARGET-softmmu/config-target.h \
+            "$BINARY_DIR"/$QEMU_TARGET-softmmu/config-target.h
+
         if [ -z "$OPT_DEBUG" ]; then
             run ${GNU_CONFIG_HOST_PREFIX}strip "$BINARY_DIR"/$QEMU_EXE
         fi
+    done
+
+    # Copy LINK-* files, adjusting hard-coded paths in them.
+    for LINK_FILE in "$BUILD_DIR"/LINK-*; do
+        [ -f $LINK_FILE ] && \
+        sed \
+            -e 's|'${PREBUILTS_DIR}'|@PREBUILTS_DIR@|g' \
+            -e 's|'${QEMU_SRCDIR}'|@SRC_DIR@|g' \
+            -e 's|'${BUILD_DIR}'||g' \
+            "$LINK_FILE" > $INSTALL_DIR/$1/$(basename "$LINK_FILE")
     done
 
     unset PKG_CONFIG PKG_CONFIG_PATH PKG_CONFIG_LIBDIR SDL_CONFIG
@@ -357,60 +519,45 @@ EOF
     timestamp_set "$INSTALL_DIR/$1" qemu-android
 }
 
-# Perform a Darwin build through ssh to a remote machine.
-# $1: Darwin host name.
-# $2: List of darwin target systems to build for.
-do_remote_darwin_build () {
-    builder_prepare_remote_darwin_build /tmp/$USER-rebuild-darwin-ssh-$$/qemu-android-build
-    local PKG_DIR="$DARWIN_PKG_DIR"
-    copy_directory "$QEMU_ANDROID" "$PKG_DIR/qemu-android-src"
+if [ "$DARWIN_SSH" -a "$DARWIN_SYSTEMS" ]; then
+    dump "Remote build for: $DARWIN_SYSTEMS"
 
-    run mkdir -p "$PKG_DIR/prebuilts"
+    display_darwin_warning
+    builder_prepare_remote_darwin_build
+
+    copy_directory "$QEMU_SRCDIR" "$DARWIN_PKG_DIR/qemu-src"
+
+    run mkdir -p "$DARWIN_PKG_DIR/prebuilts"
     for SYSTEM in $DARWIN_SYSTEMS; do
         copy_directory "$QEMU_ANDROID_DEPS_INSTALL_DIR/$SYSTEM" \
-                "$PKG_DIR/prebuilts/qemu-android-deps/$SYSTEM"
+                "$DARWIN_PKG_DIR/prebuilts/qemu-android-deps/$SYSTEM"
     done
-    copy_directory "$PREBUILTS_DIR"/archive "$PKG_DIR/prebuilts/archive"
 
-    local REMOTE_DIR=/tmp/$DARWIN_PKG_NAME
+    var_append DARWIN_BUILD_FLAGS \
+        --target=$(spaces_to_commas "$TARGETS") \
+        --src-dir=$DARWIN_REMOTE_DIR/qemu-src \
+        --prebuilts-dir=$DARWIN_REMOTE_DIR/prebuilts \
+        --install-dir=$DARWIN_REMOTE_DIR/prebuilts/qemu-android \
 
-    # Generate a script to rebuild all binaries from sources.
-    # Note that the use of the '-l' flag is important to ensure
-    # that this is run under a login shell. This ensures that
-    # ~/.bash_profile is sourced before running the script, which
-    # puts MacPorts' /opt/local/bin in the PATH properly.
-    #
-    # If not, the build is likely to fail with a cryptic error message
-    # like "readlink: illegal option -- f"
-    cat > $PKG_DIR/build.sh <<EOF
-#!/bin/bash -l
-PROGDIR=\$(dirname \$0)
-\$PROGDIR/scripts/$(program_name) \\
-    --build-dir=$REMOTE_DIR/build \\
-    --prebuilts-dir=$REMOTE_DIR/prebuilts \\
-    --aosp-dir=$REMOTE_DIR/aosp \\
-    --install-dir=$REMOTE_DIR/prebuilts/qemu-android \\
-    --host=$(spaces_to_commas "$DARWIN_SYSTEMS") \\
-    --target=$(spaces_to_commas "$TARGETS") \\
-    --src-dir=$REMOTE_DIR/qemu-android-src \\
-    $DARWIN_BUILD_FLAGS
-EOF
     builder_run_remote_darwin_build
 
     for SYSTEM in $DARWIN_SYSTEMS; do
-        local BINARY_DIR="$INSTALL_DIR/$SYSTEM"
+        BINARY_DIR="$INSTALL_DIR/$SYSTEM"
         dump "[$SYSTEM] Retrieving remote darwin binaries."
         run mkdir -p "$BINARY_DIR" ||
                 panic "Could not create installation directory: $BINARY_DIR"
-        run scp -r "$DARWIN_SSH":$REMOTE_DIR/prebuilts/qemu-android/$SYSTEM/qemu-system-* $BINARY_DIR/
 
-        timestamp_set "$INSTALL_DIR/$SYSTEM" qemu-android
+        REMOTE_SRCDIR="$DARWIN_SSH:$DARWIN_REMOTE_DIR/prebuilts/qemu-android/$SYSTEM"
+        builder_remote_darwin_scp -r \
+            "$REMOTE_SRCDIR"/qemu-system-* \
+            "$REMOTE_SRCDIR"/LINK-qemu-system-* \
+            "$REMOTE_SRCDIR"/LINK-*.a \
+            "$REMOTE_SRCDIR"/config-host.h \
+            "$REMOTE_SRCDIR"/*/config-target.h \
+            $BINARY_DIR/
+
+        timestamp_set "$BINARY_DIR" qemu-android
     done
-}
-
-if [ "$DARWIN_SSH" -a "$DARWIN_SYSTEMS" ]; then
-    dump "Remote build for: $DARWIN_SYSTEMS"
-    do_remote_darwin_build "$DARWIN_SSH" "$DARWIN_SYSTEMS"
 fi
 
 for SYSTEM in $LOCAL_HOST_SYSTEMS; do

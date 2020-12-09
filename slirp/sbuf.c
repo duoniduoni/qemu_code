@@ -5,17 +5,11 @@
  * terms and conditions of the copyright.
  */
 
-#include <slirp.h>
+#include "qemu/osdep.h"
+#include "slirp.h"
+#include "qemu/main-loop.h"
 
 static void sbappendsb(struct sbuf *sb, struct mbuf *m);
-
-/* Done as a macro in socket.h */
-/* int
- * sbspace(struct sockbuff *sb)
- * {
- *	return SB_DATALEN - sb->sb_cc;
- * }
- */
 
 void
 sbfree(struct sbuf *sb)
@@ -26,6 +20,8 @@ sbfree(struct sbuf *sb)
 void
 sbdrop(struct sbuf *sb, int num)
 {
+    int limit = sb->sb_datalen / 2;
+
 	/*
 	 * We can only drop how much we have
 	 * This should never succeed
@@ -37,6 +33,9 @@ sbdrop(struct sbuf *sb, int num)
 	if(sb->sb_rptr >= sb->sb_data + sb->sb_datalen)
 		sb->sb_rptr -= sb->sb_datalen;
 
+    if (sb->sb_cc < limit && sb->sb_cc + num >= limit) {
+        qemu_notify_event();
+    }
 }
 
 void
@@ -74,8 +73,8 @@ sbappend(struct socket *so, struct mbuf *m)
 	int ret = 0;
 
 	DEBUG_CALL("sbappend");
-	DEBUG_ARG("so = %lx", (long)so);
-	DEBUG_ARG("m = %lx", (long)m);
+	DEBUG_ARG("so = %p", so);
+	DEBUG_ARG("m = %p", m);
 	DEBUG_ARG("m->m_len = %d", m->m_len);
 
 	/* Shouldn't happen, but...  e.g. foreign host closes connection */
@@ -92,7 +91,7 @@ sbappend(struct socket *so, struct mbuf *m)
 	if (so->so_urgc) {
 		sbappendsb(&so->so_rcv, m);
 		m_free(m);
-		sosendoob(so);
+		(void)sosendoob(so);
 		return;
 	}
 

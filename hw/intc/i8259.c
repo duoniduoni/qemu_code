@@ -21,62 +21,115 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
 #include "hw/hw.h"
 #include "hw/i386/pc.h"
 #include "hw/isa/isa.h"
-#include "monitor/monitor.h"
-#include "hw/android/goldfish/device.h"
+#include "qemu/timer.h"
+#include "qemu/log.h"
+#include "hw/isa/i8259_internal.h"
+#include "trace.h"
 
 /* debug PIC */
 //#define DEBUG_PIC
 
 //#define DEBUG_IRQ_LATENCY
-//#define DEBUG_IRQ_COUNT
 
-typedef struct PicState {
-    uint8_t last_irr; /* edge detection */
-    uint8_t irr; /* interrupt request register */
-    uint8_t imr; /* interrupt mask register */
-    uint8_t isr; /* interrupt service register */
-    uint8_t priority_add; /* highest irq priority */
-    uint8_t irq_base;
-    uint8_t read_reg_select;
-    uint8_t poll;
-    uint8_t special_mask;
-    uint8_t init_state;
-    uint8_t auto_eoi;
-    uint8_t rotate_on_auto_eoi;
-    uint8_t special_fully_nested_mode;
-    uint8_t init4; /* true if 4 byte init */
-    uint8_t single_mode; /* true if slave pic is not initialized */
-    uint8_t elcr; /* PIIX edge/trigger selection*/
-    uint8_t elcr_mask;
-    PicState2 *pics_state;
-} PicState;
+#define TYPE_I8259 "isa-i8259"
+#define PIC_CLASS(class) OBJECT_CLASS_CHECK(PICClass, (class), TYPE_I8259)
+#define PIC_GET_CLASS(obj) OBJECT_GET_CLASS(PICClass, (obj), TYPE_I8259)
 
-struct PicState2 {
-    /* 0 is master pic, 1 is slave pic */
-    /* XXX: better separation between the two pics */
-    PicState pics[2];
-    qemu_irq parent_irq;
-    void *irq_request_opaque;
-    /* IOAPIC callback support */
-    SetIRQFunc *alt_irq_func;
-    void *alt_irq_opaque;
-};
+/**
+ * PICClass:
+ * @parent_realize: The parent's realizefn.
+ */
+typedef struct PICClass {
+    PICCommonClass parent_class;
 
-#if defined(DEBUG_PIC) || defined (DEBUG_IRQ_COUNT)
-static int irq_level[16];
+    DeviceRealize parent_realize;
+} PICClass;
+
+#ifdef DEBUG_IRQ_LATENCY
+static int64_t irq_time[16];
 #endif
-#ifdef DEBUG_IRQ_COUNT
-static uint64_t irq_count[16];
-#endif
+DeviceState *isa_pic;
+static PICCommonState *slave_pic;
+
+/* return the highest priority found in mask (highest = smallest
+   number). Return 8 if no irq */
+static int get_priority(PICCommonState *s, int mask)
+{
+    int priority;
+
+    if (mask == 0) {
+        return 8;
+    }
+    priority = 0;
+    while ((mask & (1 << ((priority + s->priority_add) & 7))) == 0) {
+        priority++;
+    }
+    return priority;
+}
+
+/* return the pic wanted interrupt. return -1 if none */
+static int pic_get_irq(PICCommonState *s)
+{
+    int mask, cur_priority, priority;
+
+    mask = s->irr & ~s->imr;
+    priority = get_priority(s, mask);
+    if (priority == 8) {
+        return -1;
+    }
+    /* compute current priority. If special fully nested mode on the
+       master, the IRQ coming from the slave is not taken into account
+       for the priority computation. */
+    mask = s->isr;
+    if (s->special_mask) {
+        mask &= ~s->imr;
+    }
+    if (s->special_fully_nested_mode && s->master) {
+        mask &= ~(1 << 2);
+    }
+    cur_priority = get_priority(s, mask);
+    if (priority < cur_priority) {
+        /* higher priority found: an irq should be generated */
+        return (priority + s->priority_add) & 7;
+    } else {
+        return -1;
+    }
+}
+
+/* Update INT output. Must be called every time the output may have changed. */
+static void pic_update_irq(PICCommonState *s)
+{
+    int irq;
+
+    irq = pic_get_irq(s);
+    if (irq >= 0) {
+        trace_pic_update_irq(s->master, s->imr, s->irr, s->priority_add);
+        qemu_irq_raise(s->int_out[0]);
+    } else {
+        qemu_irq_lower(s->int_out[0]);
+    }
+}
 
 /* set irq level. If an edge is detected, then the IRR is set to 1 */
-static inline void pic_set_irq1(PicState *s, int irq, int level)
+static void pic_set_irq(void *opaque, int irq, int level)
 {
-    int mask;
-    mask = 1 << irq;
+    PICCommonState *s = opaque;
+    int mask = 1 << irq;
+    int irq_index = s->master ? irq : irq + 8;
+
+    trace_pic_set_irq(s->master, irq, level);
+    pic_stat_update_irq(irq_index, level);
+
+#ifdef DEBUG_IRQ_LATENCY
+    if (level) {
+        irq_time[irq_index] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    }
+#endif
+
     if (s->elcr & mask) {
         /* level triggered */
         if (level) {
@@ -89,230 +142,122 @@ static inline void pic_set_irq1(PicState *s, int irq, int level)
     } else {
         /* edge triggered */
         if (level) {
-            if ((s->last_irr & mask) == 0)
+            if ((s->last_irr & mask) == 0) {
                 s->irr |= mask;
+            }
             s->last_irr |= mask;
         } else {
             s->last_irr &= ~mask;
         }
     }
-}
-
-/* return the highest priority found in mask (highest = smallest
-   number). Return 8 if no irq */
-static inline int get_priority(PicState *s, int mask)
-{
-    int priority;
-    if (mask == 0)
-        return 8;
-    priority = 0;
-    while ((mask & (1 << ((priority + s->priority_add) & 7))) == 0)
-        priority++;
-    return priority;
-}
-
-/* return the pic wanted interrupt. return -1 if none */
-static int pic_get_irq(PicState *s)
-{
-    int mask, cur_priority, priority;
-
-    mask = s->irr & ~s->imr;
-    priority = get_priority(s, mask);
-    if (priority == 8)
-        return -1;
-    /* compute current priority. If special fully nested mode on the
-       master, the IRQ coming from the slave is not taken into account
-       for the priority computation. */
-    mask = s->isr;
-    if (s->special_mask)
-        mask &= ~s->imr;
-    if (s->special_fully_nested_mode && s == &s->pics_state->pics[0])
-        mask &= ~(1 << 2);
-    cur_priority = get_priority(s, mask);
-    if (priority < cur_priority) {
-        /* higher priority found: an irq should be generated */
-        return (priority + s->priority_add) & 7;
-    } else {
-        return -1;
-    }
-}
-
-/* raise irq to CPU if necessary. must be called every time the active
-   irq may change */
-/* XXX: should not export it, but it is needed for an APIC kludge */
-void pic_update_irq(PicState2 *s)
-{
-    int irq2, irq;
-
-    /* first look at slave pic */
-    irq2 = pic_get_irq(&s->pics[1]);
-    if (irq2 >= 0) {
-        /* if irq request by slave pic, signal master PIC */
-        pic_set_irq1(&s->pics[0], 2, 1);
-        pic_set_irq1(&s->pics[0], 2, 0);
-    }
-    /* look at requested irq */
-    irq = pic_get_irq(&s->pics[0]);
-    if (irq >= 0) {
-#if defined(DEBUG_PIC)
-        {
-            int i;
-            for(i = 0; i < 2; i++) {
-                printf("pic%d: imr=%x irr=%x padd=%d\n",
-                       i, s->pics[i].imr, s->pics[i].irr,
-                       s->pics[i].priority_add);
-
-            }
-        }
-        printf("pic: cpu_interrupt\n");
-#endif
-        qemu_irq_raise(s->parent_irq);
-    }
-
-/* all targets should do this rather than acking the IRQ in the cpu */
-#if defined(TARGET_MIPS) || defined(TARGET_PPC) || defined(TARGET_ALPHA)
-    else {
-        qemu_irq_lower(s->parent_irq);
-    }
-#endif
-}
-
-#ifdef DEBUG_IRQ_LATENCY
-int64_t irq_time[16];
-#endif
-
-static void i8259_set_irq(void *opaque, int irq, int level)
-{
-    PicState2 *s = opaque;
-
-#if defined(DEBUG_PIC) || defined(DEBUG_IRQ_COUNT)
-    if (level != irq_level[irq]) {
-#if defined(DEBUG_PIC)
-        printf("i8259_set_irq: irq=%d level=%d\n", irq, level);
-#endif
-        irq_level[irq] = level;
-#ifdef DEBUG_IRQ_COUNT
-	if (level == 1)
-	    irq_count[irq]++;
-#endif
-    }
-#endif
-#ifdef DEBUG_IRQ_LATENCY
-    if (level) {
-        irq_time[irq] = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    }
-#endif
-    pic_set_irq1(&s->pics[irq >> 3], irq & 7, level);
-    /* used for IOAPIC irqs */
-    if (s->alt_irq_func)
-        s->alt_irq_func(s->alt_irq_opaque, irq, level);
     pic_update_irq(s);
 }
 
 /* acknowledge interrupt 'irq' */
-static inline void pic_intack(PicState *s, int irq)
+static void pic_intack(PICCommonState *s, int irq)
 {
     if (s->auto_eoi) {
-        if (s->rotate_on_auto_eoi)
+        if (s->rotate_on_auto_eoi) {
             s->priority_add = (irq + 1) & 7;
+        }
     } else {
         s->isr |= (1 << irq);
     }
     /* We don't clear a level sensitive interrupt here */
-    if (!(s->elcr & (1 << irq)))
+    if (!(s->elcr & (1 << irq))) {
         s->irr &= ~(1 << irq);
+    }
+    pic_update_irq(s);
 }
 
-int pic_read_irq(PicState2 *s)
+int pic_read_irq(DeviceState *d)
 {
+    PICCommonState *s = PIC_COMMON(d);
     int irq, irq2, intno;
 
-    irq = pic_get_irq(&s->pics[0]);
+    irq = pic_get_irq(s);
     if (irq >= 0) {
-        pic_intack(&s->pics[0], irq);
         if (irq == 2) {
-            irq2 = pic_get_irq(&s->pics[1]);
+            irq2 = pic_get_irq(slave_pic);
             if (irq2 >= 0) {
-                pic_intack(&s->pics[1], irq2);
+                pic_intack(slave_pic, irq2);
             } else {
                 /* spurious IRQ on slave controller */
                 irq2 = 7;
             }
-            intno = s->pics[1].irq_base + irq2;
-            irq = irq2 + 8;
+            intno = slave_pic->irq_base + irq2;
         } else {
-            intno = s->pics[0].irq_base + irq;
+            intno = s->irq_base + irq;
         }
+        pic_intack(s, irq);
     } else {
         /* spurious IRQ on host controller */
         irq = 7;
-        intno = s->pics[0].irq_base + irq;
+        intno = s->irq_base + irq;
     }
-    pic_update_irq(s);
+
+    if (irq == 2) {
+        irq = irq2 + 8;
+    }
 
 #ifdef DEBUG_IRQ_LATENCY
     printf("IRQ%d latency=%0.3fus\n",
            irq,
-           (double)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - irq_time[irq]) * 1000000.0 / get_ticks_per_sec);
+           (double)(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) -
+                    irq_time[irq]) * 1000000.0 / NANOSECONDS_PER_SECOND);
 #endif
-#if defined(DEBUG_PIC)
-    printf("pic_interrupt: irq=%d\n", irq);
-#endif
+
+    trace_pic_interrupt(irq, intno);
     return intno;
 }
 
-static void pic_reset(void *opaque)
+static void pic_init_reset(PICCommonState *s)
 {
-    PicState *s = opaque;
-
-    s->last_irr = 0;
-    s->irr = 0;
-    s->imr = 0;
-    s->isr = 0;
-    s->priority_add = 0;
-    s->irq_base = 0;
-    s->read_reg_select = 0;
-    s->poll = 0;
-    s->special_mask = 0;
-    s->init_state = 0;
-    s->auto_eoi = 0;
-    s->rotate_on_auto_eoi = 0;
-    s->special_fully_nested_mode = 0;
-    s->init4 = 0;
-    s->single_mode = 0;
-    /* Note: ELCR is not reset */
+    pic_reset_common(s);
+    pic_update_irq(s);
 }
 
-static void pic_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+static void pic_reset(DeviceState *dev)
 {
-    PicState *s = opaque;
+    PICCommonState *s = PIC_COMMON(dev);
+
+    s->elcr = 0;
+    pic_init_reset(s);
+}
+
+static void pic_ioport_write(void *opaque, hwaddr addr64,
+                             uint64_t val64, unsigned size)
+{
+    PICCommonState *s = opaque;
+    uint32_t addr = addr64;
+    uint32_t val = val64;
     int priority, cmd, irq;
 
-#ifdef DEBUG_PIC
-    printf("pic_write: addr=0x%02x val=0x%02x\n", addr, val);
-#endif
-    addr &= 1;
+    trace_pic_ioport_write(s->master, addr, val);
+
     if (addr == 0) {
         if (val & 0x10) {
-            /* init */
-            pic_reset(s);
-            /* deassert a pending interrupt */
-            qemu_irq_lower(s->pics_state->parent_irq);
+            pic_init_reset(s);
             s->init_state = 1;
             s->init4 = val & 1;
             s->single_mode = val & 2;
-            if (val & 0x08)
-                hw_error("level sensitive irq not supported");
+            if (val & 0x08) {
+                qemu_log_mask(LOG_UNIMP,
+                              "i8259: level sensitive irq not supported\n");
+            }
         } else if (val & 0x08) {
-            if (val & 0x04)
+            if (val & 0x04) {
                 s->poll = 1;
-            if (val & 0x02)
+            }
+            if (val & 0x02) {
                 s->read_reg_select = val & 1;
-            if (val & 0x40)
+            }
+            if (val & 0x40) {
                 s->special_mask = (val >> 5) & 1;
+            }
         } else {
             cmd = val >> 5;
-            switch(cmd) {
+            switch (cmd) {
             case 0:
             case 4:
                 s->rotate_on_auto_eoi = cmd >> 2;
@@ -323,25 +268,26 @@ static void pic_ioport_write(void *opaque, uint32_t addr, uint32_t val)
                 if (priority != 8) {
                     irq = (priority + s->priority_add) & 7;
                     s->isr &= ~(1 << irq);
-                    if (cmd == 5)
+                    if (cmd == 5) {
                         s->priority_add = (irq + 1) & 7;
-                    pic_update_irq(s->pics_state);
+                    }
+                    pic_update_irq(s);
                 }
                 break;
             case 3:
                 irq = val & 7;
                 s->isr &= ~(1 << irq);
-                pic_update_irq(s->pics_state);
+                pic_update_irq(s);
                 break;
             case 6:
                 s->priority_add = (val + 1) & 7;
-                pic_update_irq(s->pics_state);
+                pic_update_irq(s);
                 break;
             case 7:
                 irq = val & 7;
                 s->isr &= ~(1 << irq);
                 s->priority_add = (irq + 1) & 7;
-                pic_update_irq(s->pics_state);
+                pic_update_irq(s);
                 break;
             default:
                 /* no operation */
@@ -349,11 +295,11 @@ static void pic_ioport_write(void *opaque, uint32_t addr, uint32_t val)
             }
         }
     } else {
-        switch(s->init_state) {
+        switch (s->init_state) {
         case 0:
             /* normal mode */
             s->imr = val;
-            pic_update_irq(s->pics_state);
+            pic_update_irq(s);
             break;
         case 1:
             s->irq_base = val & 0xf8;
@@ -375,197 +321,143 @@ static void pic_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     }
 }
 
-static uint32_t pic_poll_read (PicState *s, uint32_t addr1)
+static uint64_t pic_ioport_read(void *opaque, hwaddr addr,
+                                unsigned size)
 {
+    PICCommonState *s = opaque;
     int ret;
 
-    ret = pic_get_irq(s);
-    if (ret >= 0) {
-        if (addr1 >> 7) {
-            s->pics_state->pics[0].isr &= ~(1 << 2);
-            s->pics_state->pics[0].irr &= ~(1 << 2);
-        }
-        s->irr &= ~(1 << ret);
-        s->isr &= ~(1 << ret);
-        if (addr1 >> 7 || ret != 2)
-            pic_update_irq(s->pics_state);
-    } else {
-        ret = 0x07;
-        pic_update_irq(s->pics_state);
-    }
-
-    return ret;
-}
-
-static uint32_t pic_ioport_read(void *opaque, uint32_t addr1)
-{
-    PicState *s = opaque;
-    unsigned int addr;
-    int ret;
-
-    addr = addr1;
-    addr &= 1;
     if (s->poll) {
-        ret = pic_poll_read(s, addr1);
+        ret = pic_get_irq(s);
+        if (ret >= 0) {
+            pic_intack(s, ret);
+            ret |= 0x80;
+        } else {
+            ret = 0;
+        }
         s->poll = 0;
     } else {
         if (addr == 0) {
-            if (s->read_reg_select)
+            if (s->read_reg_select) {
                 ret = s->isr;
-            else
+            } else {
                 ret = s->irr;
+            }
         } else {
             ret = s->imr;
         }
     }
-#ifdef DEBUG_PIC
-    printf("pic_read: addr=0x%02x val=0x%02x\n", addr1, ret);
-#endif
+    trace_pic_ioport_read(s->master, addr, ret);
     return ret;
 }
 
-/* memory mapped interrupt status */
-/* XXX: may be the same than pic_read_irq() */
-uint32_t pic_intack_read(PicState2 *s)
+int pic_get_output(DeviceState *d)
 {
-    int ret;
+    PICCommonState *s = PIC_COMMON(d);
 
-    ret = pic_poll_read(&s->pics[0], 0x00);
-    if (ret == 2)
-        ret = pic_poll_read(&s->pics[1], 0x80) + 8;
-    /* Prepare for ISR read */
-    s->pics[0].read_reg_select = 1;
-
-    return ret;
+    return (pic_get_irq(s) >= 0);
 }
 
-static void elcr_ioport_write(void *opaque, uint32_t addr, uint32_t val)
+static void elcr_ioport_write(void *opaque, hwaddr addr,
+                              uint64_t val, unsigned size)
 {
-    PicState *s = opaque;
+    PICCommonState *s = opaque;
     s->elcr = val & s->elcr_mask;
 }
 
-static uint32_t elcr_ioport_read(void *opaque, uint32_t addr1)
+static uint64_t elcr_ioport_read(void *opaque, hwaddr addr,
+                                 unsigned size)
 {
-    PicState *s = opaque;
+    PICCommonState *s = opaque;
     return s->elcr;
 }
 
-static void pic_save(QEMUFile *f, void *opaque)
-{
-    PicState *s = opaque;
+static const MemoryRegionOps pic_base_ioport_ops = {
+    .read = pic_ioport_read,
+    .write = pic_ioport_write,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
 
-    qemu_put_8s(f, &s->last_irr);
-    qemu_put_8s(f, &s->irr);
-    qemu_put_8s(f, &s->imr);
-    qemu_put_8s(f, &s->isr);
-    qemu_put_8s(f, &s->priority_add);
-    qemu_put_8s(f, &s->irq_base);
-    qemu_put_8s(f, &s->read_reg_select);
-    qemu_put_8s(f, &s->poll);
-    qemu_put_8s(f, &s->special_mask);
-    qemu_put_8s(f, &s->init_state);
-    qemu_put_8s(f, &s->auto_eoi);
-    qemu_put_8s(f, &s->rotate_on_auto_eoi);
-    qemu_put_8s(f, &s->special_fully_nested_mode);
-    qemu_put_8s(f, &s->init4);
-    qemu_put_8s(f, &s->single_mode);
-    qemu_put_8s(f, &s->elcr);
+static const MemoryRegionOps pic_elcr_ioport_ops = {
+    .read = elcr_ioport_read,
+    .write = elcr_ioport_write,
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 1,
+    },
+};
+
+static void pic_realize(DeviceState *dev, Error **errp)
+{
+    PICCommonState *s = PIC_COMMON(dev);
+    PICClass *pc = PIC_GET_CLASS(dev);
+
+    memory_region_init_io(&s->base_io, OBJECT(s), &pic_base_ioport_ops, s,
+                          "pic", 2);
+    memory_region_init_io(&s->elcr_io, OBJECT(s), &pic_elcr_ioport_ops, s,
+                          "elcr", 1);
+
+    qdev_init_gpio_out(dev, s->int_out, ARRAY_SIZE(s->int_out));
+    qdev_init_gpio_in(dev, pic_set_irq, 8);
+
+    pc->parent_realize(dev, errp);
 }
 
-static int pic_load(QEMUFile *f, void *opaque, int version_id)
+qemu_irq *i8259_init(ISABus *bus, qemu_irq parent_irq)
 {
-    PicState *s = opaque;
-
-    if (version_id != 1)
-        return -EINVAL;
-
-    qemu_get_8s(f, &s->last_irr);
-    qemu_get_8s(f, &s->irr);
-    qemu_get_8s(f, &s->imr);
-    qemu_get_8s(f, &s->isr);
-    qemu_get_8s(f, &s->priority_add);
-    qemu_get_8s(f, &s->irq_base);
-    qemu_get_8s(f, &s->read_reg_select);
-    qemu_get_8s(f, &s->poll);
-    qemu_get_8s(f, &s->special_mask);
-    qemu_get_8s(f, &s->init_state);
-    qemu_get_8s(f, &s->auto_eoi);
-    qemu_get_8s(f, &s->rotate_on_auto_eoi);
-    qemu_get_8s(f, &s->special_fully_nested_mode);
-    qemu_get_8s(f, &s->init4);
-    qemu_get_8s(f, &s->single_mode);
-    qemu_get_8s(f, &s->elcr);
-    return 0;
-}
-
-/* XXX: add generic master/slave system */
-static void pic_init1(int io_addr, int elcr_addr, PicState *s)
-{
-    register_ioport_write(io_addr, 2, 1, pic_ioport_write, s);
-    register_ioport_read(io_addr, 2, 1, pic_ioport_read, s);
-    if (elcr_addr >= 0) {
-        register_ioport_write(elcr_addr, 1, 1, elcr_ioport_write, s);
-        register_ioport_read(elcr_addr, 1, 1, elcr_ioport_read, s);
-    }
-    register_savevm(NULL, "i8259", io_addr, 1, pic_save, pic_load, s);
-    qemu_register_reset(pic_reset, 0, s);
-}
-
-void pic_info(Monitor *mon)
-{
+    qemu_irq *irq_set;
+    DeviceState *dev;
+    ISADevice *isadev;
     int i;
-    PicState *s;
 
-    if (!isa_pic)
-        return;
+    irq_set = g_new0(qemu_irq, ISA_NUM_IRQS);
 
-    for(i=0;i<2;i++) {
-        s = &isa_pic->pics[i];
-        monitor_printf(mon, "pic%d: irr=%02x imr=%02x isr=%02x hprio=%d "
-                       "irq_base=%02x rr_sel=%d elcr=%02x fnm=%d\n",
-                       i, s->irr, s->imr, s->isr, s->priority_add,
-                       s->irq_base, s->read_reg_select, s->elcr,
-                       s->special_fully_nested_mode);
+    isadev = i8259_init_chip(TYPE_I8259, bus, true);
+    dev = DEVICE(isadev);
+
+    qdev_connect_gpio_out(dev, 0, parent_irq);
+    for (i = 0 ; i < 8; i++) {
+        irq_set[i] = qdev_get_gpio_in(dev, i);
     }
-}
 
-void irq_info(Monitor *mon)
-{
-#ifndef DEBUG_IRQ_COUNT
-    monitor_printf(mon, "irq statistic code not compiled.\n");
-#else
-    int i;
-    int64_t count;
+    isa_pic = dev;
 
-    monitor_printf(mon, "IRQ statistics:\n");
-    for (i = 0; i < 16; i++) {
-        count = irq_count[i];
-        if (count > 0)
-            monitor_printf(mon, "%2d: %" PRId64 "\n", i, count);
+    isadev = i8259_init_chip(TYPE_I8259, bus, false);
+    dev = DEVICE(isadev);
+
+    qdev_connect_gpio_out(dev, 0, irq_set[2]);
+    for (i = 0 ; i < 8; i++) {
+        irq_set[i + 8] = qdev_get_gpio_in(dev, i);
     }
-#endif
+
+    slave_pic = PIC_COMMON(dev);
+
+    return irq_set;
 }
 
-qemu_irq *i8259_init(qemu_irq parent_irq)
+static void i8259_class_init(ObjectClass *klass, void *data)
 {
-    PicState2 *s;
+    PICClass *k = PIC_CLASS(klass);
+    DeviceClass *dc = DEVICE_CLASS(klass);
 
-    s = g_malloc0(sizeof(PicState2));
-    pic_init1(0x20, 0x4d0, &s->pics[0]);
-    pic_init1(0xa0, 0x4d1, &s->pics[1]);
-    s->pics[0].elcr_mask = 0xf8;
-    s->pics[1].elcr_mask = 0xde;
-    s->parent_irq = parent_irq;
-    s->pics[0].pics_state = s;
-    s->pics[1].pics_state = s;
-    isa_pic = s;
-    return qemu_allocate_irqs(i8259_set_irq, s, GFD_MAX_IRQ);
+    device_class_set_parent_realize(dc, pic_realize, &k->parent_realize);
+    dc->reset = pic_reset;
 }
 
-void pic_set_alt_irq_func(PicState2 *s, SetIRQFunc *alt_irq_func,
-                          void *alt_irq_opaque)
+static const TypeInfo i8259_info = {
+    .name       = TYPE_I8259,
+    .instance_size = sizeof(PICCommonState),
+    .parent     = TYPE_PIC_COMMON,
+    .class_init = i8259_class_init,
+    .class_size = sizeof(PICClass),
+};
+
+static void pic_register_types(void)
 {
-    s->alt_irq_func = alt_irq_func;
-    s->alt_irq_opaque = alt_irq_opaque;
+    type_register_static(&i8259_info);
 }
+
+type_init(pic_register_types)

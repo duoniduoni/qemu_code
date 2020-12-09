@@ -38,18 +38,9 @@
  * terms and conditions of the copyright.
  */
 
-#include <slirp.h>
-
-/*
- * Since this is only used in "stats socket", we give meaning
- * names instead of the REAL names
- */
-const char * const tcpstates[] = {
-/*	"CLOSED",       "LISTEN",       "SYN_SENT",     "SYN_RCVD", */
-	"REDIRECT",	"LISTEN",	"SYN_SENT",     "SYN_RCVD",
-	"ESTABLISHED",  "CLOSE_WAIT",   "FIN_WAIT_1",   "CLOSING",
-	"LAST_ACK",     "FIN_WAIT_2",   "TIME_WAIT",
-};
+#include "qemu/osdep.h"
+#include "qemu/abort.h"
+#include "slirp.h"
 
 static const u_char  tcp_outflags[TCP_NSTATES] = {
 	TH_RST|TH_ACK, 0,      TH_SYN,        TH_SYN|TH_ACK,
@@ -58,6 +49,7 @@ static const u_char  tcp_outflags[TCP_NSTATES] = {
 };
 
 
+#undef MAX_TCPOPTLEN
 #define MAX_TCPOPTLEN	32	/* max # bytes that go in options */
 
 /*
@@ -66,17 +58,26 @@ static const u_char  tcp_outflags[TCP_NSTATES] = {
 int
 tcp_output(struct tcpcb *tp)
 {
-	register struct socket *so = tp->t_socket;
+	register struct socket *so;
 	register long len, win;
 	int off, flags, error;
 	register struct mbuf *m;
-	register struct tcpiphdr *ti;
+	register struct tcpiphdr *ti, tcpiph_save;
+	struct ip *ip;
+	struct ip6 *ip6;
 	u_char opt[MAX_TCPOPTLEN];
 	unsigned optlen, hdrlen;
 	int idle, sendalot;
 
+        if (tp == NULL) {
+            qemu_abort("%s: should not happen: tp == NULL\n", __func__);
+        }
+        so = tp->t_socket;
+        if (so == NULL) {
+            qemu_abort("%s: should not happen: so == NULL\n", __func__);
+        }
 	DEBUG_CALL("tcp_output");
-	DEBUG_ARG("tp = %lx", (long )tp);
+	DEBUG_ARG("tp = %p", tp);
 
 	/*
 	 * Determine length of data that should be transmitted,
@@ -95,7 +96,7 @@ tcp_output(struct tcpcb *tp)
 again:
 	sendalot = 0;
 	off = tp->snd_nxt - tp->snd_una;
-	win = min(tp->snd_wnd, tp->snd_cwnd);
+        win = MIN(tp->snd_wnd, tp->snd_cwnd);
 
 	flags = tcp_outflags[tp->t_state];
 
@@ -134,7 +135,7 @@ again:
 		}
 	}
 
-	len = min(so->so_snd.sb_cc, win) - off;
+        len = MIN(so->so_snd.sb_cc, win) - off;
 
 	if (len < 0) {
 		/*
@@ -200,7 +201,7 @@ again:
 		 * taking into account that we are limited by
 		 * TCP_MAXWIN << tp->rcv_scale.
 		 */
-		long adv = min(win, (long)TCP_MAXWIN << tp->rcv_scale) -
+                long adv = MIN(win, (long)TCP_MAXWIN << tp->rcv_scale) -
 			(tp->rcv_adv - tp->rcv_nxt);
 
 		if (adv >= (long) (2 * tp->t_maxseg))
@@ -258,8 +259,6 @@ again:
 	/*
 	 * No reason to send a segment, just return.
 	 */
-	STAT(tcpstat.tcps_didnuttin++);
-
 	return (0);
 
 send:
@@ -276,46 +275,16 @@ send:
 	if (flags & TH_SYN) {
 		tp->snd_nxt = tp->iss;
 		if ((tp->t_flags & TF_NOOPT) == 0) {
-			u_int16_t mss;
+			uint16_t mss;
 
 			opt[0] = TCPOPT_MAXSEG;
 			opt[1] = 4;
-			mss = htons((u_int16_t) tcp_mss(tp, 0));
+			mss = htons((uint16_t) tcp_mss(tp, 0));
 			memcpy((caddr_t)(opt + 2), (caddr_t)&mss, sizeof(mss));
 			optlen = 4;
-
-/*			if ((tp->t_flags & TF_REQ_SCALE) &&
- *			    ((flags & TH_ACK) == 0 ||
- *			    (tp->t_flags & TF_RCVD_SCALE))) {
- *				*((u_int32_t *) (opt + optlen)) = htonl(
- *					TCPOPT_NOP << 24 |
- *					TCPOPT_WINDOW << 16 |
- *					TCPOLEN_WINDOW << 8 |
- *					tp->request_r_scale);
- *				optlen += 4;
- *			}
- */
 		}
  	}
 
- 	/*
-	 * Send a timestamp and echo-reply if this is a SYN and our side
-	 * wants to use timestamps (TF_REQ_TSTMP is set) or both our side
-	 * and our peer have sent timestamps in our SYN's.
- 	 */
-/* 	if ((tp->t_flags & (TF_REQ_TSTMP|TF_NOOPT)) == TF_REQ_TSTMP &&
- *	     (flags & TH_RST) == 0 &&
- *	    ((flags & (TH_SYN|TH_ACK)) == TH_SYN ||
- *	     (tp->t_flags & TF_RCVD_TSTMP))) {
- *		u_int32_t *lp = (u_int32_t *)(opt + optlen);
- *
- *		/ * Form timestamp option as shown in appendix A of RFC 1323. *  /
- *		*lp++ = htonl(TCPOPT_TSTAMP_HDR);
- *		*lp++ = htonl(tcp_now);
- *		*lp   = htonl(tp->ts_recent);
- *		optlen += TCPOLEN_TSTAMP_APPA;
- *	}
- */
  	hdrlen += optlen;
 
 	/*
@@ -333,40 +302,17 @@ send:
 	 * the template for sends on this connection.
 	 */
 	if (len) {
-		if (tp->t_force && len == 1)
-			STAT(tcpstat.tcps_sndprobe++);
-		else if (SEQ_LT(tp->snd_nxt, tp->snd_max)) {
-			STAT(tcpstat.tcps_sndrexmitpack++);
-			STAT(tcpstat.tcps_sndrexmitbyte += len);
-		} else {
-			STAT(tcpstat.tcps_sndpack++);
-			STAT(tcpstat.tcps_sndbyte += len);
-		}
-
-		m = m_get();
+		m = m_get(so->slirp);
 		if (m == NULL) {
-/*			error = ENOBUFS; */
 			error = 1;
 			goto out;
 		}
 		m->m_data += IF_MAXLINKHDR;
 		m->m_len = hdrlen;
 
-		/*
-		 * This will always succeed, since we make sure our mbufs
-		 * are big enough to hold one MSS packet + header + ... etc.
-		 */
-/*		if (len <= MHLEN - hdrlen - max_linkhdr) { */
+		sbcopy(&so->so_snd, off, (int) len, mtod(m, caddr_t) + hdrlen);
+		m->m_len += len;
 
-			sbcopy(&so->so_snd, off, (int) len, mtod(m, caddr_t) + hdrlen);
-			m->m_len += len;
-
-/*		} else {
- *			m->m_next = m_copy(so->so_snd.sb_mb, off, (int) len);
- *			if (m->m_next == 0)
- *				len = 0;
- *		}
- */
 		/*
 		 * If we're sending everything we've got, set PUSH.
 		 * (This will keep happy those implementations which only
@@ -376,18 +322,8 @@ send:
 		if (off + len == so->so_snd.sb_cc)
 			flags |= TH_PUSH;
 	} else {
-		if (tp->t_flags & TF_ACKNOW)
-			STAT(tcpstat.tcps_sndacks++);
-		else if (flags & (TH_SYN|TH_FIN|TH_RST))
-			STAT(tcpstat.tcps_sndctrl++);
-		else if (SEQ_GT(tp->snd_up, tp->snd_una))
-			STAT(tcpstat.tcps_sndurg++);
-		else
-			STAT(tcpstat.tcps_sndwinup++);
-
-		m = m_get();
+		m = m_get(so->slirp);
 		if (m == NULL) {
-/*			error = ENOBUFS; */
 			error = 1;
 			goto out;
 		}
@@ -440,14 +376,10 @@ send:
 		win = (long)TCP_MAXWIN << tp->rcv_scale;
 	if (win < (long)(tp->rcv_adv - tp->rcv_nxt))
 		win = (long)(tp->rcv_adv - tp->rcv_nxt);
-	ti->ti_win = htons((u_int16_t) (win>>tp->rcv_scale));
+	ti->ti_win = htons((uint16_t) (win>>tp->rcv_scale));
 
 	if (SEQ_GT(tp->snd_up, tp->snd_una)) {
-		ti->ti_urp = htons((u_int16_t)(tp->snd_up - ntohl(ti->ti_seq)));
-#ifdef notdef
-	if (SEQ_GT(tp->snd_up, tp->snd_nxt)) {
-		ti->ti_urp = htons((u_int16_t)(tp->snd_up - tp->snd_nxt));
-#endif
+		ti->ti_urp = htons((uint16_t)(tp->snd_up - ntohl(ti->ti_seq)));
 		ti->ti_flags |= TH_URG;
 	} else
 		/*
@@ -463,7 +395,7 @@ send:
 	 * checksum extended header and data.
 	 */
 	if (len + optlen)
-		ti->ti_len = htons((u_int16_t)(sizeof (struct tcphdr) +
+		ti->ti_len = htons((uint16_t)(sizeof (struct tcphdr) +
 		    optlen + len));
 	ti->ti_sum = cksum(m, (int)(hdrlen + len));
 
@@ -495,7 +427,6 @@ send:
 			if (tp->t_rtt == 0) {
 				tp->t_rtt = 1;
 				tp->t_rtseq = startseq;
-				STAT(tcpstat.tcps_segstimed++);
 			}
 		}
 
@@ -526,43 +457,49 @@ send:
 	 * the template, but need a way to checksum without them.
 	 */
 	m->m_len = hdrlen + len; /* XXX Needed? m_len should be correct */
+	tcpiph_save = *mtod(m, struct tcpiphdr *);
 
-    {
+	switch (so->so_ffamily) {
+	case AF_INET:
+	    m->m_data += sizeof(struct tcpiphdr) - sizeof(struct tcphdr)
+	                                         - sizeof(struct ip);
+	    m->m_len  -= sizeof(struct tcpiphdr) - sizeof(struct tcphdr)
+	                                         - sizeof(struct ip);
+	    ip = mtod(m, struct ip *);
 
-	((struct ip *)ti)->ip_len = m->m_len;
+	    ip->ip_len = m->m_len;
+	    ip->ip_dst = tcpiph_save.ti_dst;
+	    ip->ip_src = tcpiph_save.ti_src;
+	    ip->ip_p = tcpiph_save.ti_pr;
 
-	((struct ip *)ti)->ip_ttl = IPDEFTTL;
-	((struct ip *)ti)->ip_tos = so->so_iptos;
+	    ip->ip_ttl = IPDEFTTL;
+	    ip->ip_tos = so->so_iptos;
+	    error = ip_output(so, m);
+	    break;
 
-/* #if BSD >= 43 */
-	/* Don't do IP options... */
-/*	error = ip_output(m, tp->t_inpcb->inp_options, &tp->t_inpcb->inp_route,
- *	    so->so_options & SO_DONTROUTE, 0);
- */
-	error = ip_output(so, m);
+	case AF_INET6:
+	    m->m_data += sizeof(struct tcpiphdr) - sizeof(struct tcphdr)
+	                                         - sizeof(struct ip6);
+	    m->m_len  -= sizeof(struct tcpiphdr) - sizeof(struct tcphdr)
+	                                         - sizeof(struct ip6);
+	    ip6 = mtod(m, struct ip6 *);
 
-/* #else
- *	error = ip_output(m, (struct mbuf *)0, &tp->t_inpcb->inp_route,
- *	    so->so_options & SO_DONTROUTE);
- * #endif
- */
-    }
+	    ip6->ip_pl = tcpiph_save.ti_len;
+	    ip6->ip_dst = tcpiph_save.ti_dst6;
+	    ip6->ip_src = tcpiph_save.ti_src6;
+	    ip6->ip_nh = tcpiph_save.ti_nh6;
+
+	    error = ip6_output(so, m, 0);
+	    break;
+
+	default:
+	    g_assert_not_reached();
+	}
+
 	if (error) {
 out:
-/*		if (error == ENOBUFS) {
- *			tcp_quench(tp->t_inpcb, 0);
- *			return (0);
- *		}
- */
-/*		if ((error == EHOSTUNREACH || error == ENETDOWN)
- *		    && TCPS_HAVERCVDSYN(tp->t_state)) {
- *			tp->t_softerror = error;
- *			return (0);
- *		}
- */
 		return (error);
 	}
-	STAT(tcpstat.tcps_sndtotal++);
 
 	/*
 	 * Data sent (as far as we can tell).
@@ -585,9 +522,6 @@ tcp_setpersist(struct tcpcb *tp)
 {
     int t = ((tp->t_srtt >> 2) + tp->t_rttvar) >> 1;
 
-/*	if (tp->t_timer[TCPT_REXMT])
- *		panic("tcp_output REXMT");
- */
 	/*
 	 * Start/restart persistence timer.
 	 */

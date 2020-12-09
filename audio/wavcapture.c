@@ -1,5 +1,8 @@
-#include <stdio.h>
+#include "qemu/osdep.h"
+#include "hw/hw.h"
 #include "monitor/monitor.h"
+#include "qapi/error.h"
+#include "qemu/error-report.h"
 #include "audio.h"
 
 typedef struct {
@@ -35,17 +38,36 @@ static void wav_destroy (void *opaque)
     uint8_t dlen[4];
     uint32_t datalen = wav->bytes;
     uint32_t rifflen = datalen + 36;
+    Monitor *mon = cur_mon;
 
     if (wav->f) {
         le_store (rlen, rifflen, 4);
         le_store (dlen, datalen, 4);
 
-        fseek (wav->f, 4, SEEK_SET);
-        fwrite(rlen, 4, 1, wav->f);
-
-        fseek (wav->f, 32, SEEK_CUR);
-        fwrite(dlen, 4, 1, wav->f);
-        fclose (wav->f);
+        if (fseek (wav->f, 4, SEEK_SET)) {
+            monitor_printf (mon, "wav_destroy: rlen fseek failed\nReason: %s\n",
+                            strerror (errno));
+            goto doclose;
+        }
+        if (fwrite (rlen, 4, 1, wav->f) != 1) {
+            monitor_printf (mon, "wav_destroy: rlen fwrite failed\nReason %s\n",
+                            strerror (errno));
+            goto doclose;
+        }
+        if (fseek (wav->f, 32, SEEK_CUR)) {
+            monitor_printf (mon, "wav_destroy: dlen fseek failed\nReason %s\n",
+                            strerror (errno));
+            goto doclose;
+        }
+        if (fwrite (dlen, 1, 4, wav->f) != 4) {
+            monitor_printf (mon, "wav_destroy: dlen fwrite failed\nReason %s\n",
+                            strerror (errno));
+            goto doclose;
+        }
+    doclose:
+        if (fclose (wav->f)) {
+            error_report("wav_destroy: fclose failed: %s", strerror(errno));
+        }
     }
 
     g_free (wav->path);
@@ -55,7 +77,10 @@ static void wav_capture (void *opaque, void *buf, int size)
 {
     WAVState *wav = opaque;
 
-    fwrite(buf, size, 1, wav->f);
+    if (fwrite (buf, size, 1, wav->f) != 1) {
+        monitor_printf (cur_mon, "wav_capture: fwrite error\nReason: %s",
+                        strerror (errno));
+    }
     wav->bytes += size;
 }
 
@@ -64,6 +89,7 @@ static void wav_capture_destroy (void *opaque)
     WAVState *wav = opaque;
 
     AUD_del_capture (wav->cap, wav);
+    g_free (wav);
 }
 
 static void wav_capture_info (void *opaque)
@@ -71,9 +97,9 @@ static void wav_capture_info (void *opaque)
     WAVState *wav = opaque;
     char *path = wav->path;
 
-    monitor_printf(cur_mon, "Capturing audio(%d,%d,%d) to %s: %d bytes\n",
-                   wav->freq, wav->bits, wav->nchannels,
-                   path ? path : "<not available>", wav->bytes);
+    monitor_printf (cur_mon, "Capturing audio(%d,%d,%d) to %s: %d bytes\n",
+                    wav->freq, wav->bits, wav->nchannels,
+                    path ? path : "<not available>", wav->bytes);
 }
 
 static struct capture_ops wav_capture_ops = {
@@ -98,13 +124,13 @@ int wav_start_capture (CaptureState *s, const char *path, int freq,
     CaptureVoiceOut *cap;
 
     if (bits != 8 && bits != 16) {
-        monitor_printf(mon, "incorrect bit count %d, must be 8 or 16\n", bits);
+        monitor_printf (mon, "incorrect bit count %d, must be 8 or 16\n", bits);
         return -1;
     }
 
     if (nchannels != 1 && nchannels != 2) {
-        monitor_printf(mon, "incorrect channel count %d, must be 1 or 2\n",
-                       nchannels);
+        monitor_printf (mon, "incorrect channel count %d, must be 1 or 2\n",
+                        nchannels);
         return -1;
     }
 
@@ -132,8 +158,8 @@ int wav_start_capture (CaptureState *s, const char *path, int freq,
 
     wav->f = fopen (path, "wb");
     if (!wav->f) {
-        monitor_printf(mon, "Failed to open wave file `%s'\nReason: %s\n",
-                       path, strerror (errno));
+        monitor_printf (mon, "Failed to open wave file `%s'\nReason: %s\n",
+                        path, strerror (errno));
         g_free (wav);
         return -1;
     }
@@ -143,19 +169,29 @@ int wav_start_capture (CaptureState *s, const char *path, int freq,
     wav->nchannels = nchannels;
     wav->freq = freq;
 
-    fwrite(hdr, sizeof(hdr), 1, wav->f);
+    if (fwrite (hdr, sizeof (hdr), 1, wav->f) != 1) {
+        monitor_printf (mon, "Failed to write header\nReason: %s\n",
+                        strerror (errno));
+        goto error_free;
+    }
 
     cap = AUD_add_capture (&as, &ops, wav);
     if (!cap) {
-        monitor_printf(mon, "Failed to add audio capture\n");
-        g_free (wav->path);
-        fclose (wav->f);
-        g_free (wav);
-        return -1;
+        monitor_printf (mon, "Failed to add audio capture\n");
+        goto error_free;
     }
 
     wav->cap = cap;
     s->opaque = wav;
     s->ops = wav_capture_ops;
     return 0;
+
+error_free:
+    g_free (wav->path);
+    if (fclose (wav->f)) {
+        monitor_printf (mon, "Failed to close wave file\nReason: %s\n",
+                        strerror (errno));
+    }
+    g_free (wav);
+    return -1;
 }

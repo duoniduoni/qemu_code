@@ -22,13 +22,12 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <time.h>
-#include <errno.h>
-#include <sys/time.h>
-#include "config-host.h"
+/* Special case to include "qemu-options.h" here without issues */
+#undef POISON_CONFIG_ANDROID
+
+#include "qemu/osdep.h"
+#include <windows.h>
+#include <mmsystem.h>
 #include "sysemu/sysemu.h"
 #include "qemu-options.h"
 
@@ -43,42 +42,80 @@ int setenv(const char *name, const char *value, int overwrite)
         char *string = g_malloc(length);
         snprintf(string, length, "%s=%s", name, value);
         result = putenv(string);
+
+        /* Windows takes a copy and does not continue to use our string.
+         * Therefore it can be safely freed on this platform.  POSIX code
+         * typically has to leak the string because according to the spec it
+         * becomes part of the environment.
+         */
+        g_free(string);
     }
     return result;
 }
 
+static void (*ctrlc_handler)(void) = NULL;
+
+void qemu_set_ctrlc_handler(void(*handler)(void)) {
+    ctrlc_handler = handler;
+}
+
 static BOOL WINAPI qemu_ctrl_handler(DWORD type)
 {
-    exit(STATUS_CONTROL_C_EXIT);
-    return TRUE;
+    if (ctrlc_handler) {
+        (*ctrlc_handler)();
+    } else {
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_SIGNAL);
+    }
+    fflush(stdout);
+    fflush(stderr);
+
+    // There are two major ways this handler can be invoked:
+    // 1. Ctrl-C in console.
+    // 2. Pressing 'x' on the console window.
+    // If #2 (press 'x'), the emulator will close in 5 seconds
+    // unless we FreeConsole() and ExitThread(0) below.
+    // Too-early process termination can abort pending snapshot saves.
+    // This is definitely a hack that can break in future Windows versions.
+    //
+    // Note: There is another ctrl handler |ctrlHandler| in
+    // android/utils/exec.cpp that needs to be in sync with this one, so if the
+    // end result on editing this function isn't what is expected, try changing
+    // that one too.
+    if (type == CTRL_CLOSE_EVENT) {
+        FreeConsole();
+        ExitThread(0);
+    } else {
+         /* Windows 7 kills application when the function returns.
+            Sleep here to give QEMU a try for closing.
+            Sleep period is 90s */
+        Sleep(90000);
+    }
+
+    /* On timeout, return FALSE so the default handler
+     * finished the process anyway */
+
+    return FALSE;
+}
+
+static TIMECAPS mm_tc;
+
+static void os_undo_timer_resolution(void)
+{
+    timeEndPeriod(mm_tc.wPeriodMin);
 }
 
 void os_setup_early_signal_handling(void)
 {
     SetConsoleCtrlHandler(qemu_ctrl_handler, TRUE);
+    timeGetDevCaps(&mm_tc, sizeof(mm_tc));
+    timeBeginPeriod(mm_tc.wPeriodMin);
+    atexit(os_undo_timer_resolution);
 }
 
 /* Look for support files in the same directory as the executable.  */
-char *os_find_datadir(const char *argv0)
+char *os_find_datadir(void)
 {
-    char *p;
-    char buf[MAX_PATH];
-    DWORD len;
-
-    len = GetModuleFileName(NULL, buf, sizeof(buf) - 1);
-    if (len == 0) {
-        return NULL;
-    }
-
-    buf[len] = 0;
-    p = buf + len - 1;
-    while (p != buf && *p != '\\')
-        p--;
-    *p = 0;
-    if (access(buf, R_OK) == 0) {
-        return g_strdup(buf);
-    }
-    return NULL;
+    return qemu_get_exec_dir();
 }
 
 void os_set_line_buffering(void)
@@ -96,11 +133,6 @@ void os_parse_cmd_args(int index, const char *optarg)
     return;
 }
 
-void os_pidfile_error(void)
-{
-    fprintf(stderr, "Could not acquire pid file: %s\n", strerror(errno));
-}
-
 int qemu_create_pidfile(const char *filename)
 {
     char buffer[128];
@@ -110,15 +142,16 @@ int qemu_create_pidfile(const char *filename)
     BOOL ret;
     memset(&overlap, 0, sizeof(overlap));
 
-    file = CreateFile(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL,
-		      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    file = win32CreateFile(filename, GENERIC_WRITE, FILE_SHARE_READ, NULL,
+                      OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 
     if (file == INVALID_HANDLE_VALUE) {
         return -1;
     }
-    len = snprintf(buffer, sizeof(buffer), "%ld\n", (long)getpid());
-    ret = WriteFileEx(file, (LPCVOID)buffer, (DWORD)len,
-		      &overlap, NULL);
+    len = snprintf(buffer, sizeof(buffer), "%d\n", getpid());
+    ret = WriteFile(file, (LPCVOID)buffer, (DWORD)len,
+                    NULL, &overlap);
+    CloseHandle(file);
     if (ret == 0) {
         return -1;
     }

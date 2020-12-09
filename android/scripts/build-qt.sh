@@ -50,24 +50,22 @@ aosp_dir_parse_option
 install_dir_parse_option
 
 package_builder_process_options qt
+package_builder_parse_package_list
 
 ###
 ###  Download the source tarball if needed.
 ###
-ARCHIVE_DIR=$PREBUILTS_DIR/archive
-if [ ! -d "$ARCHIVE_DIR" ]; then
-    run mkdir -p "$ARCHIVE_DIR" ||
-        panic "Could not create directory: $ARCHIVE_DIR"
-fi
-
-QT_SRC_NAME=qt-everywhere-opensource-src-5.5.0
+QT_SRC_NAME=qt-everywhere-opensource-src-5.7.0
 QT_SRC_PACKAGE=$QT_SRC_NAME.tar.xz
-QT_SRC_URL=http://download.qt.io/archive/qt/5.5/5.5.0/single/$QT_SRC_PACKAGE
-QT_SRC_PACKAGE_SHA1=4409ef12d1017a9b5e6733ea27596a6ca637a88c
+QT_SRC_URL=http://download.qt.io/archive/qt/5.7/5.7.0/single/$QT_SRC_PACKAGE
+QT_SRC_PACKAGE_SHA1=bfc3d07ffba27d96cf070f74148f34a668646a19
 
-if [ -z "$OPT_DOWNLOAD" -a ! -f "$ARCHIVE_DIR/$QT_SRC_PACKAGE" ]; then
+QT_SRC_PATCH_FOLDER=${QT_SRC_NAME}-patches
+QT_ARCHIVE_DIR=$(builder_archive_dir)
+
+if [ -z "$OPT_DOWNLOAD" -a ! -f "$QT_ARCHIVE_DIR/$QT_SRC_PACKAGE" ]; then
     if [ -z "$OPT_DOWNLOAD" ]; then
-        echo "The following tarball is missing: $ARCHIVE_DIR/$QT_SRC_PACKAGE"
+        echo "The following tarball is missing: $QT_ARCHIVE_DIR/$QT_SRC_PACKAGE"
         echo "Please use the --download option to download it. Note that this is"
         echo "a huge file over 300 MB, the download will take time."
         exit 1
@@ -79,7 +77,7 @@ fi
 # $2: Destination directory.
 # $3: [Optional] expected SHA-1 sum of downloaded file.
 download_package () {
-    # Assume the packages are already downloaded under $ARCHIVE_DIR
+    # Assume the packages are already downloaded under $QT_ARCHIVE_DIR
     local DST_DIR PKG_URL PKG_NAME SHA1SUM REAL_SHA1SUM
 
     PKG_URL=$1
@@ -101,10 +99,8 @@ download_package () {
 }
 
 if [ "$OPT_DOWNLOAD" ]; then
-    download_package "$QT_SRC_URL" "$ARCHIVE_DIR" "$QT_SRC_PACKAGE_SHA1"
+    download_package "$QT_SRC_URL" "$QT_ARCHIVE_DIR" "$QT_SRC_PACKAGE_SHA1"
 fi
-
-BUILD_SRC_DIR=$TEMP_DIR/src
 
 # Atomically update target directory $1 with the content of $2.
 # This also removes $2 on success.
@@ -130,8 +126,8 @@ build_qt_package () {
     PKG_NAME=$(package_list_get_src_dir $1)
     PKG_MODULES=$2
     shift; shift
-    PKG_SRC_DIR="$BUILD_SRC_DIR/$PKG_NAME"
-    PKG_BUILD_DIR=$TEMP_DIR/build-$SYSTEM/$PKG_NAME
+    PKG_SRC_DIR=$(builder_src_dir)/$PKG_NAME
+    PKG_BUILD_DIR=$(builder_build_dir)/$PKG_NAME
     (
         run mkdir -p "$PKG_BUILD_DIR" &&
         run cd "$PKG_BUILD_DIR" &&
@@ -144,49 +140,16 @@ build_qt_package () {
             "$@" &&
         run make -j$NUM_JOBS V=1 &&
         run make install -j$NUM_JOBS V=1
-#         export QTDIR=$_SHU_BUILDER_PREFIX &&
-#         export PATH=$QTDIR/bin:$PATH &&
-#         for MODULE in $PKG_MODULES; do
-#             cd "$PKG_SRC_DIR/$MODULE" &&
-#             run qmake &&
-#             run make -j$NUM_JOBS V=1 &&
-#             run make install -j$NUM_JOBS V=1 ||
-#                 panic "Could not build Qt $MODULE module!"
-#         done
     ) ||
     panic "Could not build and install $1"
 }
 
-# Perform a Darwin build through ssh to a remote machine.
-# $1: Darwin host name.
-# $2: List of darwin target systems to build for.
-do_remote_darwin_build () {
-    builder_prepare_remote_darwin_build \
-            "/tmp/$USER-rebuild-darwin-ssh-$$/qt-build"
 
-    copy_directory "$ARCHIVE_DIR" "$DARWIN_PKG_DIR"/archive
+if [ "$DARWIN_SSH" -a "$DARWIN_SYSTEMS" ]; then
+    # Perform remote Darwin build first.
+    dump "Remote Qt build for: $DARWIN_SYSTEMS"
+    builder_prepare_remote_darwin_build
 
-    local PKG_DIR="$DARWIN_PKG_DIR"
-    local REMOTE_DIR=/tmp/$DARWIN_PKG_NAME
-    # Generate a script to rebuild all binaries from sources.
-    # Note that the use of the '-l' flag is important to ensure
-    # that this is run under a login shell. This ensures that
-    # ~/.bash_profile is sourced before running the script, which
-    # puts MacPorts' /opt/local/bin in the PATH properly.
-    #
-    # If not, the build is likely to fail with a cryptic error message
-    # like "readlink: illegal option -- f"
-    cat > $PKG_DIR/build.sh <<EOF
-#!/bin/bash -l
-PROGDIR=\$(dirname \$0)
-\$PROGDIR/scripts/$(program_name) \\
-    --build-dir=$REMOTE_DIR/build \\
-    --host=$(spaces_to_commas "$DARWIN_SYSTEMS") \\
-    --install-dir=$REMOTE_DIR/install-prefix \\
-    --prebuilts-dir=$REMOTE_DIR \\
-    --aosp-dir=$REMOTE_DIR/aosp \\
-    $DARWIN_BUILD_FLAGS
-EOF
     builder_run_remote_darwin_build
 
     run mkdir -p "$INSTALL_DIR" ||
@@ -198,24 +161,14 @@ EOF
     fi
 
     for SYSTEM in $DARWIN_SYSTEMS; do
-        dump "[$SYSTEM] Retrieving remote darwin binaries"
-        run rm -rf "$INSTALL_DIR"/* &&
-        run rsync -haz --delete --exclude=intermediates --exclude=libs \
-                $DARWIN_SSH:$REMOTE_DIR/install-prefix/$SYSTEM \
-                $INSTALL_DIR &&
+        builder_remote_darwin_retrieve_install_dir $SYSTEM $INSTALL_DIR &&
         run mkdir -p $INSTALL_DIR/common &&
-        run rsync -haz --delete --exclude=intermediates --exclude=libs \
-                $DARWIN_SSH:$REMOTE_DIR/install-prefix/common/include \
+        builder_remote_darwin_rsync -haz --delete \
+                $DARWIN_SSH:$DARWIN_REMOTE_DIR/install-prefix/common/include \
                 $INSTALL_DIR/common/
     done
 
     run rm -rf "$INSTALL_DIR/common/include.old"
-}
-
-if [ "$DARWIN_SSH" -a "$DARWIN_SYSTEMS" ]; then
-    # Perform remote Darwin build first.
-    dump "Remote Qt build for: $DARWIN_SYSTEMS"
-    do_remote_darwin_build "$DARWIN_SSH" "$DARWIN_SYSTEMS"
 fi
 
 for SYSTEM in $LOCAL_HOST_SYSTEMS; do
@@ -230,53 +183,43 @@ for SYSTEM in $LOCAL_HOST_SYSTEMS; do
         esac
 
         # Unpacking the sources if needed.
-        QT_SRC_TIMESTAMP=$TEMP_DIR/timestamp-$QT_SRC_NAME
-        if [ "$OPT_FORCE" ]; then
-            rm -f "$QT_SRC_TIMESTAMP"
-        fi
-        if [ ! -f "$QT_SRC_TIMESTAMP" ]; then
-            dump "Unpacking $QT_SRC_NAME sources."
-            run mkdir -p "$BUILD_SRC_DIR" &&
-            unpack_archive "$ARCHIVE_DIR/$QT_SRC_PACKAGE" "$BUILD_SRC_DIR" ||
-                panic "Failed to unpack source package: $QT_SRC_PACKAGE"
-
-            # Need to patch this file to avoid install syncqt.pl which will
-            # fail horribly with an error like:
-            #  ..../<binprefix>-strip:.../bin/syncqt.pl: File format not recognized
-            # because the generated Makefile tries to strip a Perl script.
-            run sed -i 's|^INSTALLS += syncqt|#INSTALLS += syncqt|g' $BUILD_SRC_DIR/$QT_SRC_NAME/qtbase/qtbase.pro
-            touch "$QT_SRC_TIMESTAMP"
+        PKG_NAME=$(package_list_get_unpack_src_dir "qt")
+        ARCHIVE_DIR=$(builder_archive_dir)
+        SRC_DIR=$(builder_src_dir)
+        TIMESTAMP=$SRC_DIR/timestamp-$PKG_NAME
+        if [ ! -f "$TIMESTAMP" -o "$OPT_FORCE" ]; then
+            package_list_unpack_and_patch "qt" "$ARCHIVE_DIR" "$SRC_DIR"
+            touch $TIMESTAMP
         fi
 
         # Configuring the build. This takes a lot of time due to QMake.
         dump "$(builder_text) Configuring Qt build"
 
+        LD_LIBRARY_PATH=
         EXTRA_CONFIGURE_FLAGS=
         var_append EXTRA_CONFIGURE_FLAGS \
                 -opensource \
                 -confirm-license \
+                -force-debug-info \
                 -release \
-                -no-c++11 \
                 -no-rpath \
-                -no-gtkstyle \
                 -shared \
                 -nomake examples \
                 -nomake tests \
+                -no-strip \
 
         if [ "$(get_verbosity)" -gt 2 ]; then
             var_append EXTRA_CONFIGURE_FLAGS "-v"
         fi
 
         case $SYSTEM in
-            linux-x86)
-                var_append EXTRA_CONFIGURE_FLAGS \
-                        -qt-xcb \
-                        -platform linux-g++-32
-                ;;
             linux-x86_64)
                 var_append EXTRA_CONFIGURE_FLAGS \
                         -qt-xcb \
+                        -no-use-gold-linker \
                         -platform linux-g++-64
+                var_append LD_LIBRARY_PATH \
+                  $(dirname $(aosp_clang_libcplusplus))
                 ;;
             windows*)
                 case $SYSTEM in
@@ -294,30 +237,52 @@ for SYSTEM in $LOCAL_HOST_SYSTEMS; do
                     -xplatform win32-g++ \
                     -device-option CROSS_COMPILE=$BINPREFIX \
                     -no-warnings-are-errors
+                var_append LDFLAGS "-Xlinker --build-id"
+
+                # Somehow Windows build doesn't generate debug information
+                # unless asked explicitly
+                var_append CFLAGS -O2 -g
+                var_append CXXFLAGS -O2 -g -fno-rtti -fno-exceptions
                 ;;
             darwin*)
+                # '-sdk macosx' without the version forces the use of the latest
+                # one installed on the build machine. To make sure one knows
+                # the verion used, let's dump all sdks
+                echo "The list of the installed OS X SDKs:"
+                xcodebuild -showsdks | grep macosx
+                echo "(using the latest version for the Qt build)"
+
                 var_append EXTRA_CONFIGURE_FLAGS \
                     -no-framework \
-                    -sdk macosx10.8
+                    -sdk macosx
+                var_append CFLAGS -mmacosx-version-min=10.8
+                var_append LDFLAGS -mmacosx-version-min=10.8
+                var_append LDFLAGS -lc++
                 ;;
         esac
 
         QT_BUILD_DIR=$(builder_build_dir)
 
+        var_append LDFLAGS "-L$_SHU_BUILDER_PREFIX/lib"
+        var_append CPPFLAGS "-I$_SHU_BUILDER_PREFIX/include"
+
         (
             run mkdir -p "$QT_BUILD_DIR" &&
             run cd "$QT_BUILD_DIR" &&
-            export LDFLAGS="-L$_SHU_BUILDER_PREFIX/lib" &&
-            export CPPFLAGS="-I$_SHU_BUILDER_PREFIX/include" &&
+            export CFLAGS &&
+            export CXXFLAGS &&
+            export LDFLAGS &&
+            export CPPFLAGS &&
+            export LD_LIBRARY_PATH &&
             export PKG_CONFIG_LIBDIR="$_SHU_BUILDER_PREFIX/lib/pkgconfig" &&
             export PKG_CONFIG_PATH="$PKG_CONFIG_LIBDIR:$_SHU_BUILDER_PKG_CONFIG_PATH" &&
-            run "$BUILD_SRC_DIR"/$QT_SRC_NAME/configure \
+            run "$(builder_src_dir)"/$QT_SRC_NAME/configure \
                 -prefix $_SHU_BUILDER_PREFIX \
                 $EXTRA_CONFIGURE_FLAGS
         ) || panic "Could not configure Qt build!"
 
         # Build everything now.
-        QT_MODULES="qtbase qtsvg"
+        QT_MODULES="qtbase qtsvg qtimageformats"
         QT_TARGET_BUILD_MODULES=
         QT_TARGET_INSTALL_MODULES=
         for QT_MODULE in $QT_MODULES; do
@@ -333,12 +298,14 @@ for SYSTEM in $LOCAL_HOST_SYSTEMS; do
         dump "$(builder_text) Building Qt binaries"
         (
             run cd "$QT_BUILD_DIR" &&
+            export LD_LIBRARY_PATH &&
             run make $QT_MAKE_FLAGS $QT_TARGET_BUILD_MODULES
         ) || panic "Could not build Qt binaries!"
 
         dump "$(builder_text) Installing Qt binaries"
         (
             run cd "$QT_BUILD_DIR" &&
+            export LD_LIBRARY_PATH &&
             run make $QT_MAKE_FLAGS $QT_TARGET_INSTALL_MODULES
         ) || panic "Could not install Qt binaries!"
 
@@ -378,7 +345,16 @@ for SYSTEM in $LOCAL_HOST_SYSTEMS; do
                         "$INSTALL_DIR/$SYSTEM" \
                         lib/libqtmain.a
                 ;;
+            linux*)
+                # Copy over libc++.so, so we can use it during build.
+                cp $(aosp_clang_libcplusplus) "$INSTALL_DIR/$SYSTEM/lib"
+                ;;
         esac
+
+        build_debug_info \
+                "$(builder_install_prefix)" \
+                "$INSTALL_DIR/$SYSTEM" \
+                $QT_SHARED_LIBS
 
         # Copy headers into common directory and add symlink
         copy_directory \
@@ -391,6 +367,12 @@ for SYSTEM in $LOCAL_HOST_SYSTEMS; do
 
         (cd "$INSTALL_DIR/$SYSTEM" && rm -f include && ln -sf ../common/include include)
 
+        # Move qconfig.h into its platform-specific directory now
+        run mkdir -p "$INSTALL_DIR/$SYSTEM"/include.system/QtCore/
+        run mv -f \
+            "$INSTALL_DIR"/common/include/QtCore/qconfig.h \
+            "$INSTALL_DIR/$SYSTEM"/include.system/QtCore/ \
+            || panic "[$SYSTEM] Failed to move the platform-specific config file 'include/QtCore/qconfig.h'"
     ) || panic "[$SYSTEM] Could not build Qt!"
 
 done

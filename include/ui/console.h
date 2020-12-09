@@ -1,16 +1,26 @@
 #ifndef CONSOLE_H
 #define CONSOLE_H
 
-#include "sysemu/char.h"
-#include "qapi/qmp/qdict.h"
+#include "ui/qemu-pixman.h"
+#include "qom/object.h"
 #include "qemu/notify.h"
+#include "qemu/error-report.h"
+#include "qapi/qapi-types-ui.h"
+
+#ifdef CONFIG_OPENGL
+# include <epoxy/gl.h>
+# include "ui/shader.h"
+#endif
+
+#include <stdbool.h>
 
 /* keyboard/mouse support */
 
 #define MOUSE_EVENT_LBUTTON 0x01
 #define MOUSE_EVENT_RBUTTON 0x02
 #define MOUSE_EVENT_MBUTTON 0x04
-extern int multitouch_enabled;
+#define MOUSE_EVENT_WHEELUP 0x08
+#define MOUSE_EVENT_WHEELDN 0x10
 
 /* identical to the ps/2 keyboard bits */
 #define QEMU_SCROLL_LOCK_LED (1 << 0)
@@ -18,48 +28,34 @@ extern int multitouch_enabled;
 #define QEMU_CAPS_LOCK_LED   (1 << 2)
 
 /* in ms */
-#ifdef CONFIG_ANDROID
-#define GUI_REFRESH_INTERVAL (1000/60)  /* 60 frames/s is better */
-#else
-#define GUI_REFRESH_INTERVAL 30
-#endif
+#define GUI_REFRESH_INTERVAL_DEFAULT    30
+#define GUI_REFRESH_INTERVAL_IDLE     3000
 
-typedef int QEMUDisplayCloseCallback(void *opaque);
-void qemu_set_display_close_handler(QEMUDisplayCloseCallback *cb, void *opaque);
-int qemu_run_display_close_handler(void);
+/* Color number is match to standard vga palette */
+enum qemu_color_names {
+    QEMU_COLOR_BLACK   = 0,
+    QEMU_COLOR_BLUE    = 1,
+    QEMU_COLOR_GREEN   = 2,
+    QEMU_COLOR_CYAN    = 3,
+    QEMU_COLOR_RED     = 4,
+    QEMU_COLOR_MAGENTA = 5,
+    QEMU_COLOR_YELLOW  = 6,
+    QEMU_COLOR_WHITE   = 7
+};
+/* Convert to curses char attributes */
+#define ATTR2CHTYPE(c, fg, bg, bold) \
+    ((bold) << 21 | (bg) << 11 | (fg) << 8 | (c))
 
 typedef void QEMUPutKBDEvent(void *opaque, int keycode);
 typedef void QEMUPutLEDEvent(void *opaque, int ledstate);
 typedef void QEMUPutMouseEvent(void *opaque, int dx, int dy, int dz, int buttons_state);
 
-typedef struct QEMUPutMouseEntry {
-    QEMUPutMouseEvent *qemu_put_mouse_event;
-    void *qemu_put_mouse_event_opaque;
-    int qemu_put_mouse_event_absolute;
-    char *qemu_put_mouse_event_name;
+typedef struct QEMUPutMouseEntry QEMUPutMouseEntry;
+typedef struct QEMUPutKbdEntry QEMUPutKbdEntry;
+typedef struct QEMUPutLEDEntry QEMUPutLEDEntry;
 
-    int index;
-
-    /* used internally by qemu for handling mice */
-    QTAILQ_ENTRY(QEMUPutMouseEntry) node;
-} QEMUPutMouseEntry;
-
-typedef struct QEMUPutKBDEntry {
-    QEMUPutKBDEvent *put_kbd_event;
-    void *opaque;
-
-    /* used internally by qemu for handling keyboards */
-    QTAILQ_ENTRY(QEMUPutKBDEntry) next;
-} QEMUPutKBDEntry;
-
-typedef struct QEMUPutLEDEntry {
-    QEMUPutLEDEvent *put_led;
-    void *opaque;
-    QTAILQ_ENTRY(QEMUPutLEDEntry) next;
-} QEMUPutLEDEntry;
-
-void qemu_add_kbd_event_handler(QEMUPutKBDEvent *func, void *opaque);
-void qemu_remove_kbd_event_handler(QEMUPutKBDEvent *func, void *opaque);
+QEMUPutKbdEntry *qemu_add_kbd_event_handler(QEMUPutKBDEvent *func,
+                                            void *opaque);
 QEMUPutMouseEntry *qemu_add_mouse_event_handler(QEMUPutMouseEvent *func,
                                                 void *opaque, int absolute,
                                                 const char *name);
@@ -69,17 +65,9 @@ void qemu_activate_mouse_event_handler(QEMUPutMouseEntry *entry);
 QEMUPutLEDEntry *qemu_add_led_event_handler(QEMUPutLEDEvent *func, void *opaque);
 void qemu_remove_led_event_handler(QEMUPutLEDEntry *entry);
 
-void kbd_put_keycode(int keycode);
 void kbd_put_ledstate(int ledstate);
-void kbd_mouse_event(int dx, int dy, int dz, int buttons_state);
 
-/* Does the current mouse generate absolute events */
-int kbd_mouse_is_absolute(void);
-void qemu_add_mouse_mode_change_notifier(Notifier *notify);
-void qemu_remove_mouse_mode_change_notifier(Notifier *notify);
-
-/* Of all the mice, is there one that generates absolute events */
-int kbd_mouse_has_absolute(void);
+void kbd_mouse_event(int dx, int dy, int dz, int buttonsState);
 
 struct MouseTransformInfo {
     /* Touchscreen resolution */
@@ -89,9 +77,7 @@ struct MouseTransformInfo {
     int a[7];
 };
 
-void do_info_mice_print(Monitor *mon, const QObject *data);
-void do_info_mice(Monitor *mon, QObject **ret_data);
-void do_mouse_set(Monitor *mon, const QDict *qdict);
+void hmp_mouse_set(Monitor *mon, const QDict *qdict);
 
 /* keysym is a unicode code except for special keys (see QEMU_KEY_xxx
    constants) */
@@ -116,13 +102,29 @@ void do_mouse_set(Monitor *mon, const QDict *qdict);
 #define QEMU_KEY_CTRL_PAGEUP     0xe406
 #define QEMU_KEY_CTRL_PAGEDOWN   0xe407
 
+void kbd_put_keysym_console(QemuConsole *s, int keysym);
+bool kbd_put_qcode_console(QemuConsole *s, int qcode, bool ctrl);
+void kbd_put_string_console(QemuConsole *s, const char *str, int len);
 void kbd_put_keysym(int keysym);
+void kbd_put_keycode(int keycode, bool down);
 
 /* consoles */
 
-#define QEMU_BIG_ENDIAN_FLAG    0x01
-#define QEMU_ALLOCATED_FLAG     0x02
-#define QEMU_REALPIXELS_FLAG    0x04
+#define TYPE_QEMU_CONSOLE "qemu-console"
+#define QEMU_CONSOLE(obj) \
+    OBJECT_CHECK(QemuConsole, (obj), TYPE_QEMU_CONSOLE)
+#define QEMU_CONSOLE_GET_CLASS(obj) \
+    OBJECT_GET_CLASS(QemuConsoleClass, (obj), TYPE_QEMU_CONSOLE)
+#define QEMU_CONSOLE_CLASS(klass) \
+    OBJECT_CLASS_CHECK(QemuConsoleClass, (klass), TYPE_QEMU_CONSOLE)
+
+typedef struct QemuConsoleClass QemuConsoleClass;
+
+struct QemuConsoleClass {
+    ObjectClass parent_class;
+};
+
+#define QEMU_ALLOCATED_FLAG     0x01
 
 struct PixelFormat {
     uint8_t bits_per_pixel;
@@ -135,14 +137,23 @@ struct PixelFormat {
 };
 
 struct DisplaySurface {
+    pixman_format_code_t format;
+    pixman_image_t *image;
     uint8_t flags;
-    int width;
-    int height;
-    int linesize;        /* bytes per line */
-    uint8_t *data;
-
-    struct PixelFormat pf;
+#ifdef CONFIG_OPENGL
+    GLenum glformat;
+    GLenum gltype;
+    GLuint texture;
+#endif
 };
+
+typedef struct QemuUIInfo {
+    /* geometry */
+    int       xoff;
+    int       yoff;
+    uint32_t  width;
+    uint32_t  height;
+} QemuUIInfo;
 
 /* cursor data format is 32bit RGBA */
 typedef struct QEMUCursor {
@@ -165,312 +176,317 @@ void cursor_set_mono(QEMUCursor *c,
 void cursor_get_mono_image(QEMUCursor *c, int foreground, uint8_t *mask);
 void cursor_get_mono_mask(QEMUCursor *c, int transparent, uint8_t *mask);
 
+typedef void *QEMUGLContext;
+typedef struct QEMUGLParams QEMUGLParams;
+
+struct QEMUGLParams {
+    int major_ver;
+    int minor_ver;
+};
+
+struct QemuDmaBuf {
+    int       fd;
+    uint32_t  width;
+    uint32_t  height;
+    uint32_t  stride;
+    uint32_t  fourcc;
+    uint32_t  texture;
+};
+
+typedef struct DisplayChangeListenerOps {
+    const char *dpy_name;
+
+    void (*dpy_refresh)(DisplayChangeListener *dcl);
+
+    void (*dpy_gfx_update)(DisplayChangeListener *dcl,
+                           int x, int y, int w, int h);
+    void (*dpy_gfx_switch)(DisplayChangeListener *dcl,
+                           struct DisplaySurface *new_surface);
+    bool (*dpy_gfx_check_format)(DisplayChangeListener *dcl,
+                                 pixman_format_code_t format);
+
+    void (*dpy_text_cursor)(DisplayChangeListener *dcl,
+                            int x, int y);
+    void (*dpy_text_resize)(DisplayChangeListener *dcl,
+                            int w, int h);
+    void (*dpy_text_update)(DisplayChangeListener *dcl,
+                            int x, int y, int w, int h);
+
+    void (*dpy_mouse_set)(DisplayChangeListener *dcl,
+                          int x, int y, int on);
+    void (*dpy_cursor_define)(DisplayChangeListener *dcl,
+                              QEMUCursor *cursor);
+
+    QEMUGLContext (*dpy_gl_ctx_create)(DisplayChangeListener *dcl,
+                                       QEMUGLParams *params);
+    void (*dpy_gl_ctx_destroy)(DisplayChangeListener *dcl,
+                               QEMUGLContext ctx);
+    int (*dpy_gl_ctx_make_current)(DisplayChangeListener *dcl,
+                                   QEMUGLContext ctx);
+    QEMUGLContext (*dpy_gl_ctx_get_current)(DisplayChangeListener *dcl);
+
+    void (*dpy_gl_scanout_disable)(DisplayChangeListener *dcl);
+    void (*dpy_gl_scanout_texture)(DisplayChangeListener *dcl,
+                                   uint32_t backing_id,
+                                   bool backing_y_0_top,
+                                   uint32_t backing_width,
+                                   uint32_t backing_height,
+                                   uint32_t x, uint32_t y,
+                                   uint32_t w, uint32_t h);
+    void (*dpy_gl_scanout_dmabuf)(DisplayChangeListener *dcl,
+                                  QemuDmaBuf *dmabuf);
+    void (*dpy_gl_cursor_dmabuf)(DisplayChangeListener *dcl,
+                                 QemuDmaBuf *dmabuf, bool have_hot,
+                                 uint32_t hot_x, uint32_t hot_y);
+    void (*dpy_gl_cursor_position)(DisplayChangeListener *dcl,
+                                   uint32_t pos_x, uint32_t pos_y);
+    void (*dpy_gl_release_dmabuf)(DisplayChangeListener *dcl,
+                                  QemuDmaBuf *dmabuf);
+    void (*dpy_gl_update)(DisplayChangeListener *dcl,
+                          uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
+} DisplayChangeListenerOps;
+
 struct DisplayChangeListener {
-    int idle;
-    uint64_t gui_timer_interval;
+    uint64_t update_interval;
+    const DisplayChangeListenerOps *ops;
+    DisplayState *ds;
+    QemuConsole *con;
 
-    void (*dpy_update)(struct DisplayState *s, int x, int y, int w, int h);
-    void (*dpy_resize)(struct DisplayState *s);
-    void (*dpy_setdata)(struct DisplayState *s);
-    void (*dpy_refresh)(struct DisplayState *s);
-    void (*dpy_copy)(struct DisplayState *s, int src_x, int src_y,
-                     int dst_x, int dst_y, int w, int h);
-    void (*dpy_fill)(struct DisplayState *s, int x, int y,
-                     int w, int h, uint32_t c);
-    void (*dpy_text_cursor)(struct DisplayState *s, int x, int y);
-#ifdef CONFIG_GLES2
-    void (*dpy_updatecaption)(void);
-#endif
-#ifdef CONFIG_SKINNING
-    void (*dpy_enablezoom)(struct DisplayState *s, int width, int height);
-    void (*dpy_getresolution)(int *width, int *height);
-#endif
-    struct DisplayChangeListener *next;
+    QLIST_ENTRY(DisplayChangeListener) next;
 };
 
-#ifdef CONFIG_ANDROID
-/* The problem with DisplayChangeListener is that the callbacks can't
- * differentiate between different DisplayChangeListeners. Instead of
- * modifying the type above, which is going to generate conflicts with
- * upstream changes, we define our own listener type here.
- */
-typedef struct DisplayUpdateListener {
-    void* opaque;
-    void (*dpy_update)(void* opaque, int x, int y, int w, int h);
-    struct DisplayUpdateListener *next;
-} DisplayUpdateListener;
-#endif
-
-struct DisplayAllocator {
-    DisplaySurface* (*create_displaysurface)(int width, int height);
-    DisplaySurface* (*resize_displaysurface)(DisplaySurface *surface, int width, int height);
-    void (*free_displaysurface)(DisplaySurface *surface);
-};
-
-struct DisplayState {
-    struct DisplaySurface *surface;
-    void *opaque;
-    struct QEMUTimer *gui_timer;
-
-    struct DisplayAllocator* allocator;
-    struct DisplayChangeListener* listeners;
-#ifdef CONFIG_ANDROID
-    struct DisplayUpdateListener* update_listeners;
-#endif
-    void (*mouse_set)(int x, int y, int on);
-    void (*cursor_define)(QEMUCursor *cursor);
-
-    struct DisplayState *next;
-};
-
-void vga_fill_rect (DisplayState *ds, int posx, int posy,
-    int width, int height, uint32_t color);
-void register_displaystate(DisplayState *ds);
-DisplayState *get_displaystate(void);
-DisplaySurface* qemu_create_displaysurface_from(int width, int height, int bpp,
+DisplayState *init_displaystate(void);
+DisplaySurface *qemu_create_displaysurface_from(int width, int height,
+                                                pixman_format_code_t format,
                                                 int linesize, uint8_t *data);
-void qemu_alloc_display(DisplaySurface *surface, int width, int height,
-                        int linesize, PixelFormat pf, int newflags);
-PixelFormat qemu_different_endianness_pixelformat(int bpp);
+DisplaySurface *qemu_create_displaysurface_pixman(pixman_image_t *image);
+DisplaySurface *qemu_create_displaysurface_guestmem(int width, int height,
+                                                    pixman_format_code_t format,
+                                                    int linesize,
+                                                    uint64_t addr);
+DisplaySurface *qemu_create_message_surface(int w, int h,
+                                            const char *msg);
 PixelFormat qemu_default_pixelformat(int bpp);
 
-DisplayAllocator *register_displayallocator(DisplayState *ds, DisplayAllocator *da);
-
-static inline DisplaySurface* qemu_create_displaysurface(DisplayState *ds, int width, int height)
-{
-    return ds->allocator->create_displaysurface(width, height);
-}
-
-static inline DisplaySurface* qemu_resize_displaysurface(DisplayState *ds, int width, int height)
-{
-    return ds->allocator->resize_displaysurface(ds->surface, width, height);
-}
-
-static inline void qemu_free_displaysurface(DisplayState *ds)
-{
-    ds->allocator->free_displaysurface(ds->surface);
-}
+DisplaySurface *qemu_create_displaysurface(int width, int height);
+void qemu_free_displaysurface(DisplaySurface *surface);
 
 static inline int is_surface_bgr(DisplaySurface *surface)
 {
-    if (surface->pf.bits_per_pixel == 32 && surface->pf.rshift == 0)
+    if (PIXMAN_FORMAT_BPP(surface->format) == 32 &&
+        PIXMAN_FORMAT_TYPE(surface->format) == PIXMAN_TYPE_ABGR) {
         return 1;
-    else
+    } else {
         return 0;
+    }
 }
 
 static inline int is_buffer_shared(DisplaySurface *surface)
 {
-    return (!(surface->flags & QEMU_ALLOCATED_FLAG) &&
-            !(surface->flags & QEMU_REALPIXELS_FLAG));
+    return !(surface->flags & QEMU_ALLOCATED_FLAG);
 }
 
-static inline void register_displaychangelistener(DisplayState *ds, DisplayChangeListener *dcl)
+void register_displaychangelistener(DisplayChangeListener *dcl);
+void update_displaychangelistener(DisplayChangeListener *dcl,
+                                  uint64_t interval);
+void unregister_displaychangelistener(DisplayChangeListener *dcl);
+
+bool dpy_ui_info_supported(QemuConsole *con);
+int dpy_set_ui_info(QemuConsole *con, QemuUIInfo *info);
+
+void dpy_gfx_update(QemuConsole *con, int x, int y, int w, int h);
+void dpy_gfx_replace_surface(QemuConsole *con,
+                             DisplaySurface *surface);
+void dpy_text_cursor(QemuConsole *con, int x, int y);
+void dpy_text_update(QemuConsole *con, int x, int y, int w, int h);
+void dpy_text_resize(QemuConsole *con, int w, int h);
+void dpy_mouse_set(QemuConsole *con, int x, int y, int on);
+void dpy_cursor_define(QemuConsole *con, QEMUCursor *cursor);
+bool dpy_cursor_define_supported(QemuConsole *con);
+bool dpy_gfx_check_format(QemuConsole *con,
+                          pixman_format_code_t format);
+
+void dpy_gl_scanout_disable(QemuConsole *con);
+void dpy_gl_scanout_texture(QemuConsole *con,
+                            uint32_t backing_id, bool backing_y_0_top,
+                            uint32_t backing_width, uint32_t backing_height,
+                            uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+void dpy_gl_scanout_dmabuf(QemuConsole *con,
+                           QemuDmaBuf *dmabuf);
+void dpy_gl_cursor_dmabuf(QemuConsole *con, QemuDmaBuf *dmabuf,
+                          bool have_hot, uint32_t hot_x, uint32_t hot_y);
+void dpy_gl_cursor_position(QemuConsole *con,
+                            uint32_t pos_x, uint32_t pos_y);
+void dpy_gl_release_dmabuf(QemuConsole *con,
+                           QemuDmaBuf *dmabuf);
+void dpy_gl_update(QemuConsole *con,
+                   uint32_t x, uint32_t y, uint32_t w, uint32_t h);
+
+QEMUGLContext dpy_gl_ctx_create(QemuConsole *con,
+                                QEMUGLParams *params);
+void dpy_gl_ctx_destroy(QemuConsole *con, QEMUGLContext ctx);
+int dpy_gl_ctx_make_current(QemuConsole *con, QEMUGLContext ctx);
+QEMUGLContext dpy_gl_ctx_get_current(QemuConsole *con);
+
+bool console_has_gl(QemuConsole *con);
+bool console_has_gl_dmabuf(QemuConsole *con);
+
+/* Run the display update and input processing ASAP. */
+void dpy_run_update(QemuConsole* con);
+
+static inline int surface_stride(DisplaySurface *s)
 {
-    dcl->next = ds->listeners;
-    ds->listeners = dcl;
+    return pixman_image_get_stride(s->image);
 }
 
-#ifdef CONFIG_ANDROID
-static inline void register_displayupdatelistener(DisplayState *ds, DisplayUpdateListener *dul)
+static inline void *surface_data(DisplaySurface *s)
 {
-    dul->next = ds->update_listeners;
-    ds->update_listeners = dul;
+    return pixman_image_get_data(s->image);
 }
 
-void unregister_displayupdatelistener(DisplayState *ds, DisplayUpdateListener *dul);
-#endif
-
-static inline void dpy_update(DisplayState *s, int x, int y, int w, int h)
+static inline int surface_width(DisplaySurface *s)
 {
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        dcl->dpy_update(s, x, y, w, h);
-        dcl = dcl->next;
-    }
-#ifdef CONFIG_ANDROID
-    DisplayUpdateListener* dul = s->update_listeners;
-    while (dul != NULL) {
-        dul->dpy_update(dul->opaque, x, y, w, h);
-        dul = dul->next;
-    }
-#endif
+    return pixman_image_get_width(s->image);
 }
 
-#ifdef CONFIG_GLES2
-static inline void dpy_updatecaption(DisplayState *s)
+static inline int surface_height(DisplaySurface *s)
 {
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        if(dcl->dpy_updatecaption != NULL)
-        {
-            dcl->dpy_updatecaption();
-        }
-        dcl = dcl->next;
-    }
+    return pixman_image_get_height(s->image);
 }
-#endif
 
-static inline void dpy_resize(DisplayState *s)
+static inline int surface_bits_per_pixel(DisplaySurface *s)
 {
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        dcl->dpy_resize(s);
-        dcl = dcl->next;
-    }
+    int bits = PIXMAN_FORMAT_BPP(s->format);
+    return bits;
 }
 
-static inline void dpy_setdata(DisplayState *s)
+static inline int surface_bytes_per_pixel(DisplaySurface *s)
 {
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        if (dcl->dpy_setdata) dcl->dpy_setdata(s);
-        dcl = dcl->next;
-    }
+    int bits = PIXMAN_FORMAT_BPP(s->format);
+    return DIV_ROUND_UP(bits, 8);
 }
 
-static inline void dpy_refresh(DisplayState *s)
+static inline pixman_format_code_t surface_format(DisplaySurface *s)
 {
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        if (dcl->dpy_refresh) dcl->dpy_refresh(s);
-        dcl = dcl->next;
-    }
+    return s->format;
 }
 
-static inline void dpy_copy(struct DisplayState *s, int src_x, int src_y,
-                             int dst_x, int dst_y, int w, int h) {
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        if (dcl->dpy_copy)
-            dcl->dpy_copy(s, src_x, src_y, dst_x, dst_y, w, h);
-        else /* TODO */
-            dcl->dpy_update(s, dst_x, dst_y, w, h);
-        dcl = dcl->next;
-    }
-}
+typedef uint32_t console_ch_t;
 
-static inline void dpy_fill(struct DisplayState *s, int x, int y,
-                             int w, int h, uint32_t c) {
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        if (dcl->dpy_fill) dcl->dpy_fill(s, x, y, w, h, c);
-        dcl = dcl->next;
-    }
-}
-
-static inline void dpy_cursor(struct DisplayState *s, int x, int y) {
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        if (dcl->dpy_text_cursor) dcl->dpy_text_cursor(s, x, y);
-        dcl = dcl->next;
-    }
-}
-
-#ifdef CONFIG_SKINNING
-static inline void dpy_enablezoom(struct DisplayState *s, int width, int height)
-{
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        if (dcl->dpy_enablezoom) dcl->dpy_enablezoom(s, width, height);
-        dcl = dcl->next;
-    }
-}
-
-static inline void dpy_getresolution(struct DisplayState *s, int *width, int *height)
-{
-    struct DisplayChangeListener *dcl = s->listeners;
-    while (dcl != NULL) {
-        if (dcl->dpy_getresolution) dcl->dpy_getresolution(width, height);
-        dcl = dcl->next;
-    }
-}
-#endif
-
-static inline int ds_get_linesize(DisplayState *ds)
-{
-    return ds->surface->linesize;
-}
-
-static inline uint8_t* ds_get_data(DisplayState *ds)
-{
-    return ds->surface->data;
-}
-
-static inline int ds_get_width(DisplayState *ds)
-{
-    return ds->surface->width;
-}
-
-static inline int ds_get_height(DisplayState *ds)
-{
-    return ds->surface->height;
-}
-
-static inline int ds_get_bits_per_pixel(DisplayState *ds)
-{
-    return ds->surface->pf.bits_per_pixel;
-}
-
-static inline int ds_get_bytes_per_pixel(DisplayState *ds)
-{
-    return ds->surface->pf.bytes_per_pixel;
-}
-
-typedef unsigned long console_ch_t;
 static inline void console_write_ch(console_ch_t *dest, uint32_t ch)
 {
-    if (!(ch & 0xff))
-        ch |= ' ';
     *dest = ch;
 }
 
-typedef void (*vga_hw_update_ptr)(void *);
-typedef void (*vga_hw_invalidate_ptr)(void *);
-typedef void (*vga_hw_screen_dump_ptr)(void *, const char *);
-typedef void (*vga_hw_text_update_ptr)(void *, console_ch_t *);
+typedef struct GraphicHwOps {
+    void (*invalidate)(void *opaque);
+    void (*gfx_update)(void *opaque);
+    void (*text_update)(void *opaque, console_ch_t *text);
+    void (*update_interval)(void *opaque, uint64_t interval);
+    int (*ui_info)(void *opaque, uint32_t head, QemuUIInfo *info);
+    void (*gl_block)(void *opaque, bool block);
+} GraphicHwOps;
 
-DisplayState *graphic_console_init(vga_hw_update_ptr update,
-                                   vga_hw_invalidate_ptr invalidate,
-                                   vga_hw_screen_dump_ptr screen_dump,
-                                   vga_hw_text_update_ptr text_update,
-                                   void *opaque);
+QemuConsole *graphic_console_init(DeviceState *dev, uint32_t head,
+                                  const GraphicHwOps *ops,
+                                  void *opaque);
+void graphic_console_set_hwops(QemuConsole *con,
+                               const GraphicHwOps *hw_ops,
+                               void *opaque);
+void graphic_console_close(QemuConsole *con);
 
-void vga_hw_update(void);
-void vga_hw_invalidate(void);
-void vga_hw_screen_dump(const char *filename);
-void vga_hw_text_update(console_ch_t *chardata);
+void graphic_hw_update(QemuConsole *con);
+void graphic_hw_invalidate(QemuConsole *con);
+void graphic_hw_text_update(QemuConsole *con, console_ch_t *chardata);
+void graphic_hw_gl_block(QemuConsole *con, bool block);
 
-int is_graphic_console(void);
-int is_fixedsize_console(void);
-CharDriverState *text_console_init(QemuOpts *opts);
-CharDriverState* text_console_init_compat(const char *label, const char *p);
-void text_consoles_set_display(DisplayState *ds);
+void qemu_console_early_init(void);
+
+QemuConsole *qemu_console_lookup_by_index(unsigned int index);
+QemuConsole *qemu_console_lookup_by_device(DeviceState *dev, uint32_t head);
+QemuConsole *qemu_console_lookup_by_device_name(const char *device_id,
+                                                uint32_t head, Error **errp);
+QemuConsole *qemu_console_lookup_unused(void);
+bool qemu_console_is_visible(QemuConsole *con);
+bool qemu_console_is_graphic(QemuConsole *con);
+bool qemu_console_is_fixedsize(QemuConsole *con);
+bool qemu_console_is_gl_blocked(QemuConsole *con);
+char *qemu_console_get_label(QemuConsole *con);
+int qemu_console_get_index(QemuConsole *con);
+uint32_t qemu_console_get_head(QemuConsole *con);
+QemuUIInfo *qemu_console_get_ui_info(QemuConsole *con);
+int qemu_console_get_width(QemuConsole *con, int fallback);
+int qemu_console_get_height(QemuConsole *con, int fallback);
+/* Return the low-level window id for the console */
+int qemu_console_get_window_id(QemuConsole *con);
+/* Set the low-level window id for the console */
+void qemu_console_set_window_id(QemuConsole *con, int window_id);
+
 void console_select(unsigned int index);
-void console_color_init(DisplayState *ds);
-void qemu_console_resize(DisplayState *ds, int width, int height);
-void qemu_console_copy(DisplayState *ds, int src_x, int src_y,
-                       int dst_x, int dst_y, int w, int h);
+void qemu_console_resize(QemuConsole *con, int width, int height);
+DisplaySurface *qemu_console_surface(QemuConsole *con);
 
-/* sdl.c */
-void sdl_display_init(DisplayState *ds, int full_screen, int no_frame);
-
-/* cocoa.m */
-void cocoa_display_init(DisplayState *ds, int full_screen);
-
-/* vnc.c */
-void vnc_display_init(DisplayState *ds);
-void vnc_display_close(DisplayState *ds);
-int vnc_display_open(DisplayState *ds, const char *display);
-int vnc_display_password(DisplayState *ds, const char *password);
-void do_info_vnc(Monitor *mon);
-char *vnc_display_local_addr(DisplayState *ds);
-
-/* curses.c */
-void curses_display_init(DisplayState *ds, int full_screen);
-
-#ifdef CONFIG_ANDROID
-void android_display_reset(DisplayState* ds, int width, int height, int bitspp);
+/* console-gl.c */
+#ifdef CONFIG_OPENGL
+bool console_gl_check_format(DisplayChangeListener *dcl,
+                             pixman_format_code_t format);
+void surface_gl_create_texture(QemuGLShader *gls,
+                               DisplaySurface *surface);
+void surface_gl_update_texture(QemuGLShader *gls,
+                               DisplaySurface *surface,
+                               int x, int y, int w, int h);
+void surface_gl_render_texture(QemuGLShader *gls,
+                               DisplaySurface *surface);
+void surface_gl_destroy_texture(QemuGLShader *gls,
+                               DisplaySurface *surface);
+void surface_gl_setup_viewport(QemuGLShader *gls,
+                               DisplaySurface *surface,
+                               int ww, int wh);
 #endif
 
+/* sdl.c */
+#ifdef CONFIG_SDL
+void sdl_display_early_init(DisplayOptions *opts);
+int sdl_display_init(DisplayState *ds, DisplayOptions *opts);
+#else
+static inline void sdl_display_early_init(DisplayOptions *opts)
+{
+    /* This must never be called if CONFIG_SDL is disabled */
+    error_report("SDL support is disabled");
+    abort();
+}
+static inline int sdl_display_init(DisplayState *ds, DisplayOptions *opts)
+{
+    /* This must never be called if CONFIG_SDL is disabled */
+    error_report("SDL support is disabled");
+    return false;
+}
+#endif
+
+typedef struct {
+    DisplayType type;
+    void (*early_init)(DisplayOptions *opts);
+    int (*init)(DisplayState *ds, DisplayOptions *opts);
+} QemuDisplay;
+
+void qemu_display_register(QemuDisplay *ui);
+bool qemu_display_find_default(DisplayOptions *opts);
+void qemu_display_early_init(DisplayOptions *opts);
+void qemu_display_init(DisplayState *ds, DisplayOptions *opts);
+
+/* vnc.c */
+void vnc_display_init(const char *id);
+void vnc_display_open(const char *id, Error **errp);
+void vnc_display_add_client(const char *id, int csock, bool skipauth);
+int vnc_display_password(const char *id, const char *password);
+int vnc_display_pw_expire(const char *id, time_t expires);
+QemuOpts *vnc_parse(const char *str, Error **errp);
+int vnc_init_func(void *opaque, QemuOpts *opts, Error **errp);
+
+/* input.c */
+int index_from_key(const char *key, size_t key_length);
+
+/* android */
+QemuConsole *qemu_active_console();
 #endif

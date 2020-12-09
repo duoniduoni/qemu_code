@@ -22,7 +22,10 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
  * THE SOFTWARE.
  */
+#include "qemu/osdep.h"
 #include "qemu-common.h"
+#include "qemu/bswap.h"
+#include "qemu/error-report.h"
 #include "audio.h"
 
 #define AUDIO_CAP "mixeng"
@@ -33,7 +36,8 @@
 #define ENDIAN_CONVERT(v) (v)
 
 /* Signed 8 bit */
-#define IN_T int8_t
+#define BSIZE 8
+#define ITYPE int
 #define IN_MIN SCHAR_MIN
 #define IN_MAX SCHAR_MAX
 #define SIGNED
@@ -42,25 +46,29 @@
 #undef SIGNED
 #undef IN_MAX
 #undef IN_MIN
-#undef IN_T
+#undef BSIZE
+#undef ITYPE
 #undef SHIFT
 
 /* Unsigned 8 bit */
-#define IN_T uint8_t
+#define BSIZE 8
+#define ITYPE uint
 #define IN_MIN 0
 #define IN_MAX UCHAR_MAX
 #define SHIFT 8
 #include "mixeng_template.h"
 #undef IN_MAX
 #undef IN_MIN
-#undef IN_T
+#undef BSIZE
+#undef ITYPE
 #undef SHIFT
 
 #undef ENDIAN_CONVERT
 #undef ENDIAN_CONVERSION
 
 /* Signed 16 bit */
-#define IN_T int16_t
+#define BSIZE 16
+#define ITYPE int
 #define IN_MIN SHRT_MIN
 #define IN_MAX SHRT_MAX
 #define SIGNED
@@ -78,11 +86,13 @@
 #undef SIGNED
 #undef IN_MAX
 #undef IN_MIN
-#undef IN_T
+#undef BSIZE
+#undef ITYPE
 #undef SHIFT
 
 /* Unsigned 16 bit */
-#define IN_T uint16_t
+#define BSIZE 16
+#define ITYPE uint
 #define IN_MIN 0
 #define IN_MAX USHRT_MAX
 #define SHIFT 16
@@ -98,11 +108,13 @@
 #undef ENDIAN_CONVERSION
 #undef IN_MAX
 #undef IN_MIN
-#undef IN_T
+#undef BSIZE
+#undef ITYPE
 #undef SHIFT
 
 /* Signed 32 bit */
-#define IN_T int32_t
+#define BSIZE 32
+#define ITYPE int
 #define IN_MIN INT32_MIN
 #define IN_MAX INT32_MAX
 #define SIGNED
@@ -120,11 +132,13 @@
 #undef SIGNED
 #undef IN_MAX
 #undef IN_MIN
-#undef IN_T
+#undef BSIZE
+#undef ITYPE
 #undef SHIFT
 
 /* Unsigned 32 bit */
-#define IN_T uint32_t
+#define BSIZE 32
+#define ITYPE uint
 #define IN_MIN 0
 #define IN_MAX UINT32_MAX
 #define SHIFT 32
@@ -140,7 +154,8 @@
 #undef ENDIAN_CONVERSION
 #undef IN_MAX
 #undef IN_MIN
-#undef IN_T
+#undef BSIZE
+#undef ITYPE
 #undef SHIFT
 
 t_sample *mixeng_conv[2][2][2][3] = {
@@ -253,11 +268,42 @@ f_sample *mixeng_clip[2][2][2][3] = {
     }
 };
 
+
+void audio_sample_to_uint64(void *samples, int pos,
+                            uint64_t *left, uint64_t *right)
+{
+    struct st_sample *sample = samples;
+    sample += pos;
+#ifdef FLOAT_MIXENG
+    error_report(
+        "Coreaudio and floating point samples are not supported by replay yet");
+    abort();
+#else
+    *left = sample->l;
+    *right = sample->r;
+#endif
+}
+
+void audio_sample_from_uint64(void *samples, int pos,
+                            uint64_t left, uint64_t right)
+{
+    struct st_sample *sample = samples;
+    sample += pos;
+#ifdef FLOAT_MIXENG
+    error_report(
+        "Coreaudio and floating point samples are not supported by replay yet");
+    abort();
+#else
+    sample->l = left;
+    sample->r = right;
+#endif
+}
+
 /*
  * August 21, 1998
  * Copyright 1998 Fabrice Bellard.
  *
- * [Rewrote completly the code of Lance Norskog And Sundry
+ * [Rewrote completely the code of Lance Norskog And Sundry
  * Contributors with a more efficient algorithm.]
  *
  * This source code is freely redistributable and may be used for
@@ -298,10 +344,10 @@ struct rate {
  */
 void *st_rate_start (int inrate, int outrate)
 {
-    struct rate *rate = audio_calloc (AUDIO_FUNC, 1, sizeof (*rate));
+    struct rate *rate = audio_calloc(__func__, 1, sizeof(*rate));
 
     if (!rate) {
-        dolog ("Could not allocate resampler (%u bytes)\n", (int)sizeof (*rate));
+        dolog ("Could not allocate resampler (%zu bytes)\n", sizeof (*rate));
         return NULL;
     }
 
@@ -332,4 +378,23 @@ void st_rate_stop (void *opaque)
 void mixeng_clear (struct st_sample *buf, int len)
 {
     memset (buf, 0, len * sizeof (struct st_sample));
+}
+
+void mixeng_volume (struct st_sample *buf, int len, struct mixeng_volume *vol)
+{
+    if (vol->mute) {
+        mixeng_clear (buf, len);
+        return;
+    }
+
+    while (len--) {
+#ifdef FLOAT_MIXENG
+        buf->l = buf->l * vol->l;
+        buf->r = buf->r * vol->r;
+#else
+        buf->l = (buf->l * vol->l) >> 32;
+        buf->r = (buf->r * vol->r) >> 32;
+#endif
+        buf += 1;
+    }
 }

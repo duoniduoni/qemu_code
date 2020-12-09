@@ -19,11 +19,19 @@
  * By Richard W.M. Jones (rjones@redhat.com).
  */
 
-#include "qemu-common.h"
+#include "qemu/osdep.h"
+#include "qemu/option.h"
+#include "qemu/config-file.h"
 #include "qemu/queue.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-run-state.h"
+#include "qapi/qapi-events-run-state.h"
 #include "sysemu/sysemu.h"
 #include "sysemu/watchdog.h"
+#include "hw/nmi.h"
+#include "qemu/help_option.h"
 
+static WatchdogAction watchdog_action = WATCHDOG_ACTION_RESET;
 static QLIST_HEAD(watchdog_list, WatchdogTimerModel) watchdog_list;
 
 void watchdog_add_model(WatchdogTimerModel *model)
@@ -39,15 +47,10 @@ void watchdog_add_model(WatchdogTimerModel *model)
 int select_watchdog(const char *p)
 {
     WatchdogTimerModel *model;
-
-    if (watchdog) {
-        fprintf(stderr,
-                 "qemu: only one watchdog option may be given\n");
-        return 1;
-    }
+    QemuOpts *opts;
 
     /* -watchdog ? lists available devices and exits cleanly. */
-    if (strcmp(p, "?") == 0) {
+    if (is_help_option(p)) {
         QLIST_FOREACH(model, &watchdog_list, entry) {
             fprintf(stderr, "\t%s\t%s\n",
                      model->wdt_name, model->wdt_description);
@@ -57,7 +60,10 @@ int select_watchdog(const char *p)
 
     QLIST_FOREACH(model, &watchdog_list, entry) {
         if (strcasecmp(model->wdt_name, p) == 0) {
-            watchdog = model;
+            /* add the device */
+            opts = qemu_opts_create(qemu_find_opts("device"), NULL, 0,
+                                    &error_abort);
+            qemu_opt_set(opts, "driver", p, &error_abort);
             return 0;
         }
     }
@@ -72,22 +78,21 @@ int select_watchdog(const char *p)
 
 int select_watchdog_action(const char *p)
 {
-    if (strcasecmp(p, "reset") == 0)
-        watchdog_action = WDT_RESET;
-    else if (strcasecmp(p, "shutdown") == 0)
-        watchdog_action = WDT_SHUTDOWN;
-    else if (strcasecmp(p, "poweroff") == 0)
-        watchdog_action = WDT_POWEROFF;
-    else if (strcasecmp(p, "pause") == 0)
-        watchdog_action = WDT_PAUSE;
-    else if (strcasecmp(p, "debug") == 0)
-        watchdog_action = WDT_DEBUG;
-    else if (strcasecmp(p, "none") == 0)
-        watchdog_action = WDT_NONE;
-    else
-        return -1;
+    int action;
+    char *qapi_value;
 
+    qapi_value = g_ascii_strdown(p, -1);
+    action = qapi_enum_parse(&WatchdogAction_lookup, qapi_value, -1, NULL);
+    g_free(qapi_value);
+    if (action < 0)
+        return -1;
+    qmp_watchdog_set_action(action, &error_abort);
     return 0;
+}
+
+WatchdogAction get_watchdog_action(void)
+{
+    return watchdog_action;
 }
 
 /* This actually performs the "action" once a watchdog has expired,
@@ -95,42 +100,51 @@ int select_watchdog_action(const char *p)
  */
 void watchdog_perform_action(void)
 {
-    switch(watchdog_action) {
-    case WDT_RESET:             /* same as 'system_reset' in monitor */
-        qemu_system_reset_request();
+    switch (watchdog_action) {
+    case WATCHDOG_ACTION_RESET:     /* same as 'system_reset' in monitor */
+        qapi_event_send_watchdog(WATCHDOG_ACTION_RESET, &error_abort);
+        qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
         break;
 
-    case WDT_SHUTDOWN:          /* same as 'system_powerdown' in monitor */
+    case WATCHDOG_ACTION_SHUTDOWN:  /* same as 'system_powerdown' in monitor */
+        qapi_event_send_watchdog(WATCHDOG_ACTION_SHUTDOWN, &error_abort);
         qemu_system_powerdown_request();
         break;
 
-    case WDT_POWEROFF:          /* same as 'quit' command in monitor */
+    case WATCHDOG_ACTION_POWEROFF:  /* same as 'quit' command in monitor */
+        qapi_event_send_watchdog(WATCHDOG_ACTION_POWEROFF, &error_abort);
         exit(0);
+
+    case WATCHDOG_ACTION_PAUSE:     /* same as 'stop' command in monitor */
+        /* In a timer callback, when vm_stop calls qemu_clock_enable
+         * you would get a deadlock.  Bypass the problem.
+         */
+        qemu_system_vmstop_request_prepare();
+        qapi_event_send_watchdog(WATCHDOG_ACTION_PAUSE, &error_abort);
+        qemu_system_vmstop_request(RUN_STATE_WATCHDOG);
         break;
 
-    case WDT_PAUSE:             /* same as 'stop' command in monitor */
-        vm_stop(0);
-        break;
-
-    case WDT_DEBUG:
+    case WATCHDOG_ACTION_DEBUG:
+        qapi_event_send_watchdog(WATCHDOG_ACTION_DEBUG, &error_abort);
         fprintf(stderr, "watchdog: timer fired\n");
         break;
 
-    case WDT_NONE:
+    case WATCHDOG_ACTION_NONE:
+        qapi_event_send_watchdog(WATCHDOG_ACTION_NONE, &error_abort);
         break;
+
+    case WATCHDOG_ACTION_INJECT_NMI:
+        qapi_event_send_watchdog(WATCHDOG_ACTION_INJECT_NMI,
+                                 &error_abort);
+        nmi_monitor_handle(0, NULL);
+        break;
+
+    default:
+        assert(0);
     }
 }
 
-void watchdog_pc_init(PCIBus *pci_bus)
+void qmp_watchdog_set_action(WatchdogAction action, Error **errp)
 {
-    if (watchdog)
-        watchdog->wdt_pc_init(pci_bus);
-}
-
-void register_watchdogs(void)
-{
-#if 0
-    wdt_ib700_init();
-    wdt_i6300esb_init();
-#endif
+    watchdog_action = action;
 }

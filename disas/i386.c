@@ -31,8 +31,10 @@
    and the small letter tells about the operand size.  Refer to
    the Intel manual for details.  */
 
-#include <stdlib.h>
+#include "qemu/osdep.h"
 #include "disas/bfd.h"
+#include "qemu/cutils.h"
+
 /* include/opcode/i386.h r1.78 */
 
 /* opcode/i386.h -- Intel 80386 opcode macros
@@ -153,8 +155,6 @@
 /* opcodes/i386-dis.c r1.126 */
 #include "qemu-common.h"
 
-#include <setjmp.h>
-
 static int fetch_data2(struct disassemble_info *, bfd_byte *);
 static int fetch_data(struct disassemble_info *, bfd_byte *);
 static void ckprefix (void);
@@ -171,6 +171,7 @@ static void print_operand_value (char *buf, size_t bufsize, int hex, bfd_vma dis
 static void print_displacement (char *, bfd_vma);
 static void OP_E (int, int);
 static void OP_G (int, int);
+static void OP_vvvv (int, int);
 static bfd_vma get64 (void);
 static bfd_signed_vma get32 (void);
 static bfd_signed_vma get32s (void);
@@ -238,11 +239,6 @@ enum address_mode
 
 static enum address_mode address_mode;
 
-/* Helper macro used to avoid compiler warnings when using
- * constant strings. This is equivalent to |x + intel_syntax|
- * otherwise. */
-#define INTEL_SYNTAX(x)  &x[(int)(intel_syntax)]
-
 /* Flags for the prefixes for the current instruction.  See below.  */
 static int prefixes;
 
@@ -269,6 +265,9 @@ static int rex_used;
    current instruction.  */
 static int used_prefixes;
 
+/* The VEX.vvvv register, unencoded.  */
+static int vex_reg;
+
 /* Flags stored in PREFIXES.  */
 #define PREFIX_REPZ 1
 #define PREFIX_REPNZ 2
@@ -282,6 +281,10 @@ static int used_prefixes;
 #define PREFIX_DATA 0x200
 #define PREFIX_ADDR 0x400
 #define PREFIX_FWAIT 0x800
+
+#define PREFIX_VEX_0F    0x1000
+#define PREFIX_VEX_0F38  0x2000
+#define PREFIX_VEX_0F3A  0x4000
 
 /* Make sure that bytes from INFO->PRIVATE_DATA->BUFFER (inclusive)
    to ADDR (exclusive) are valid.  Returns 1 for success, longjmps
@@ -328,6 +331,7 @@ fetch_data(struct disassemble_info *info, bfd_byte *addr)
 
 #define XX { NULL, 0 }
 
+#define Bv { OP_vvvv, v_mode }
 #define Eb { OP_E, b_mode }
 #define Ev { OP_E, v_mode }
 #define Ed { OP_E, d_mode }
@@ -353,7 +357,7 @@ fetch_data(struct disassemble_info *info, bfd_byte *addr)
 #define Rd { OP_R, d_mode }
 #define Rm { OP_R, m_mode }
 #define Ib { OP_I, b_mode }
-#define sIb { OP_sI, b_mode }	/* sign extened byte */
+#define sIb { OP_sI, b_mode }	/* sign extended byte */
 #define Iv { OP_I, v_mode }
 #define Iq { OP_I, q_mode }
 #define Iv64 { OP_I64, v_mode }
@@ -676,7 +680,11 @@ fetch_data(struct disassemble_info *info, bfd_byte *addr)
 #define PREGRP102 NULL, { { NULL, USE_PREFIX_USER_TABLE }, { NULL, 102 } }
 #define PREGRP103 NULL, { { NULL, USE_PREFIX_USER_TABLE }, { NULL, 103 } }
 #define PREGRP104 NULL, { { NULL, USE_PREFIX_USER_TABLE }, { NULL, 104 } }
-
+#define PREGRP105 NULL, { { NULL, USE_PREFIX_USER_TABLE }, { NULL, 105 } }
+#define PREGRP106 NULL, { { NULL, USE_PREFIX_USER_TABLE }, { NULL, 106 } }
+#define PREGRP107 NULL, { { NULL, USE_PREFIX_USER_TABLE }, { NULL, 107 } }
+#define PREGRP108 NULL, { { NULL, USE_PREFIX_USER_TABLE }, { NULL, 108 } }
+#define PREGRP109 NULL, { { NULL, USE_PREFIX_USER_TABLE }, { NULL, 109 } }
 
 #define X86_64_0  NULL, { { NULL, X86_64_SPECIAL }, { NULL, 0 } }
 #define X86_64_1  NULL, { { NULL, X86_64_SPECIAL }, { NULL, 1 } }
@@ -1242,7 +1250,7 @@ static const struct dis386 dis386_twobyte[] = {
   { "ud2b",		{ XX } },
   { GRP8 },
   { "btcS",		{ Ev, Gv } },
-  { "bsfS",		{ Gv, Ev } },
+  { PREGRP107 },
   { PREGRP36 },
   { "movs{bR|x|bR|x}",	{ Gv, Eb } },
   { "movs{wR|x|wR|x}",	{ Gv, Ew } }, /* yes, there really is movsww ! */
@@ -1426,7 +1434,7 @@ static const unsigned char twobyte_uses_REPZ_prefix[256] = {
   /* 80 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 8f */
   /* 90 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* 9f */
   /* a0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* af */
-  /* b0 */ 0,0,0,0,0,0,0,0,1,0,0,0,0,1,0,0, /* bf */
+  /* b0 */ 0,0,0,0,0,0,0,0,1,0,0,0,1,1,0,0, /* bf */
   /* c0 */ 0,0,1,0,0,0,0,0,0,0,0,0,0,0,0,0, /* cf */
   /* d0 */ 0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0, /* df */
   /* e0 */ 0,0,0,0,0,0,1,0,0,0,0,0,0,0,0,0, /* ef */
@@ -1454,7 +1462,7 @@ static const unsigned char threebyte_0x38_uses_DATA_prefix[256] = {
   /* c0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* cf */
   /* d0 */ 0,0,0,0,0,0,0,0,0,0,0,1,1,1,1,1, /* df */
   /* e0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ef */
-  /* f0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ff */
+  /* f0 */ 0,0,0,0,0,0,0,1,0,0,0,0,0,0,0,0, /* ff */
   /*       -------------------------------        */
   /*       0 1 2 3 4 5 6 7 8 9 a b c d e f        */
 };
@@ -1478,7 +1486,7 @@ static const unsigned char threebyte_0x38_uses_REPNZ_prefix[256] = {
   /* c0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* cf */
   /* d0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* df */
   /* e0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ef */
-  /* f0 */ 1,1,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ff */
+  /* f0 */ 1,1,0,0,0,1,0,1,0,0,0,0,0,0,0,0, /* ff */
   /*       -------------------------------        */
   /*       0 1 2 3 4 5 6 7 8 9 a b c d e f        */
 };
@@ -1502,7 +1510,7 @@ static const unsigned char threebyte_0x38_uses_REPZ_prefix[256] = {
   /* c0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* cf */
   /* d0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* df */
   /* e0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ef */
-  /* f0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ff */
+  /* f0 */ 0,0,0,0,0,1,0,1,0,0,0,0,0,0,0,0, /* ff */
   /*       -------------------------------        */
   /*       0 1 2 3 4 5 6 7 8 9 a b c d e f        */
 };
@@ -1550,7 +1558,7 @@ static const unsigned char threebyte_0x3a_uses_REPNZ_prefix[256] = {
   /* c0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* cf */
   /* d0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* df */
   /* e0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ef */
-  /* f0 */ 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ff */
+  /* f0 */ 1,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0, /* ff */
   /*       -------------------------------        */
   /*       0 1 2 3 4 5 6 7 8 9 a b c d e f        */
 };
@@ -2637,17 +2645,17 @@ static const struct dis386 prefix_user_table[][4] = {
 
   /* PREGRP87 */
   {
+    { "movbe",	{ Gv, Ev } },
     { "(bad)",	{ XX } },
-    { "(bad)",	{ XX } },
-    { "(bad)",	{ XX } },
+    { "movbe",	{ Gv, Ev } },
     { "crc32",	{ Gdq, { CRC32_Fixup, b_mode } } },
   },
 
   /* PREGRP88 */
   {
+    { "movbe",	{ Ev, Gv } },
     { "(bad)",	{ XX } },
-    { "(bad)",	{ XX } },
-    { "(bad)",	{ XX } },
+    { "movbe",	{ Ev, Gv } },
     { "crc32",	{ Gdq, { CRC32_Fixup, v_mode } } },
   },
 
@@ -2779,6 +2787,45 @@ static const struct dis386 prefix_user_table[][4] = {
     { "(bad)",	{ XX } },
   },
 
+  /* PREGRP105 */
+  {
+    { "andnS",	{ Gv, Bv, Ev } },
+    { "(bad)",	{ XX } },
+    { "(bad)",	{ XX } },
+    { "(bad)",	{ XX } },
+  },
+
+  /* PREGRP106 */
+  {
+    { "bextrS",	{ Gv, Ev, Bv } },
+    { "sarxS",	{ Gv, Ev, Bv } },
+    { "shlxS",	{ Gv, Ev, Bv } },
+    { "shrxS",	{ Gv, Ev, Bv } },
+  },
+
+  /* PREGRP107 */
+  {
+    { "bsfS",	{ Gv, Ev } },
+    { "tzcntS",	{ Gv, Ev } },
+    { "bsfS",	{ Gv, Ev } },
+    { "(bad)",	{ XX } },
+  },
+
+  /* PREGRP108 */
+  {
+    { "bzhi",   { Gv, Ev, Bv } },
+    { "pext",   { Gv, Bv, Ev } },
+    { "(bad)",  { XX } },
+    { "pdep",   { Gv, Bv, Ev } },
+  },
+
+  /* PREGRP109 */
+  {
+    { "(bad)",  { XX } },
+    { "(bad)",  { XX } },
+    { "(bad)",  { XX } },
+    { "rorx",   { Gv, Ev, Ib } },
+  },
 };
 
 static const struct dis386 x86_64_table[][2] = {
@@ -3076,12 +3123,12 @@ static const struct dis386 three_byte_table[][256] = {
     /* f0 */
     { PREGRP87 },
     { PREGRP88 },
+    { PREGRP105 },
     { "(bad)", { XX } },
     { "(bad)", { XX } },
+    { PREGRP108 },
     { "(bad)", { XX } },
-    { "(bad)", { XX } },
-    { "(bad)", { XX } },
-    { "(bad)", { XX } },
+    { PREGRP106 },
     /* f8 */
     { "(bad)", { XX } },
     { "(bad)", { XX } },
@@ -3365,7 +3412,7 @@ static const struct dis386 three_byte_table[][256] = {
     { "(bad)", { XX } },
     { "(bad)", { XX } },
     /* f0 */
-    { "(bad)", { XX } },
+    { PREGRP109 },
     { "(bad)", { XX } },
     { "(bad)", { XX } },
     { "(bad)", { XX } },
@@ -3385,7 +3432,7 @@ static const struct dis386 three_byte_table[][256] = {
   }
 };
 
-#define INTERNAL_DISASSEMBLER_ERROR _("<internal disassembler error>")
+#define INTERNAL_DISASSEMBLER_ERROR "<internal disassembler error>"
 
 static void
 ckprefix (void)
@@ -3480,6 +3527,75 @@ ckprefix (void)
       rex = newrex;
       codep++;
     }
+}
+
+static void
+ckvexprefix (void)
+{
+    int op, vex2, vex3, newrex = 0, newpfx = prefixes;
+
+    if (address_mode == mode_16bit) {
+        return;
+    }
+
+    fetch_data(the_info, codep + 1);
+    op = *codep;
+
+    if (op != 0xc4 && op != 0xc5) {
+        return;
+    }
+
+    fetch_data(the_info, codep + 2);
+    vex2 = codep[1];
+
+    if (address_mode == mode_32bit && (vex2 & 0xc0) != 0xc0) {
+        return;
+    }
+
+    if (op == 0xc4) {
+        /* Three byte VEX prefix.  */
+        fetch_data(the_info, codep + 3);
+        vex3 = codep[2];
+
+        newrex |= (vex2 & 0x80 ? 0 : REX_R);
+        newrex |= (vex2 & 0x40 ? 0 : REX_X);
+        newrex |= (vex2 & 0x20 ? 0 : REX_B);
+        newrex |= (vex3 & 0x80 ? REX_W : 0);
+        switch (vex2 & 0x1f) {      /* VEX.m-mmmm */
+        case 1:
+            newpfx |= PREFIX_VEX_0F;
+            break;
+        case 2:
+            newpfx |= PREFIX_VEX_0F | PREFIX_VEX_0F38;
+            break;
+        case 3:
+            newpfx |= PREFIX_VEX_0F | PREFIX_VEX_0F3A;
+            break;
+        }
+        vex2 = vex3;
+        codep += 3;
+    } else {
+        /* Two byte VEX prefix.  */
+        newrex |= (vex2 & 0x80 ? 0 : REX_R);
+        newpfx |= PREFIX_VEX_0F;
+        codep += 2;
+    }
+
+    vex_reg = (~vex2 >> 3) & 15;     /* VEX.vvvv */
+    switch (vex2 & 3) {              /* VEX.pp */
+    case 1:
+        newpfx |= PREFIX_DATA;     /* 0x66 */
+        break;
+    case 2:
+        newpfx |= PREFIX_REPZ;     /* 0xf3 */
+        break;
+    case 3:
+        newpfx |= PREFIX_REPNZ;    /* 0xf2 */
+        break;
+    }
+
+    rex = newrex;
+    prefixes = newpfx;
 }
 
 /* Return the name of the prefix byte PREF, or NULL if PREF is not a
@@ -3603,6 +3719,7 @@ print_insn (bfd_vma pc, disassemble_info *info)
   const char *p;
   struct dis_private priv;
   unsigned char op;
+  unsigned char threebyte;
 
   if (info->mach == bfd_mach_x86_64_intel_syntax
       || info->mach == bfd_mach_x86_64)
@@ -3757,6 +3874,7 @@ print_insn (bfd_vma pc, disassemble_info *info)
 
   obufp = obuf;
   ckprefix ();
+  ckvexprefix ();
 
   insn_codep = codep;
   sizeflag = priv.orig_sizeflag;
@@ -3780,18 +3898,29 @@ print_insn (bfd_vma pc, disassemble_info *info)
     }
 
   op = 0;
+  if (prefixes & PREFIX_VEX_0F)
+    {
+      used_prefixes |= PREFIX_VEX_0F | PREFIX_VEX_0F38 | PREFIX_VEX_0F3A;
+      if (prefixes & PREFIX_VEX_0F38)
+        threebyte = 0x38;
+      else if (prefixes & PREFIX_VEX_0F3A)
+        threebyte = 0x3a;
+      else
+        threebyte = *codep++;
+      goto vex_opcode;
+    }
   if (*codep == 0x0f)
     {
-      unsigned char threebyte;
       fetch_data(info, codep + 2);
-      threebyte = *++codep;
+      threebyte = codep[1];
+      codep += 2;
+    vex_opcode:
       dp = &dis386_twobyte[threebyte];
-      need_modrm = twobyte_has_modrm[*codep];
-      uses_DATA_prefix = twobyte_uses_DATA_prefix[*codep];
-      uses_REPNZ_prefix = twobyte_uses_REPNZ_prefix[*codep];
-      uses_REPZ_prefix = twobyte_uses_REPZ_prefix[*codep];
-      uses_LOCK_prefix = (*codep & ~0x02) == 0x20;
-      codep++;
+      need_modrm = twobyte_has_modrm[threebyte];
+      uses_DATA_prefix = twobyte_uses_DATA_prefix[threebyte];
+      uses_REPNZ_prefix = twobyte_uses_REPNZ_prefix[threebyte];
+      uses_REPZ_prefix = twobyte_uses_REPZ_prefix[threebyte];
+      uses_LOCK_prefix = (threebyte & ~0x02) == 0x20;
       if (dp->name == NULL && dp->op[0].bytemode == IS_3BYTE_OPCODE)
 	{
           fetch_data(info, codep + 2);
@@ -3933,7 +4062,7 @@ print_insn (bfd_vma pc, disassemble_info *info)
 	    }
 	}
 
-      if (putop (dp->name, sizeflag) == 0)
+      if (dp->name != NULL && putop (dp->name, sizeflag) == 0)
         {
 	  for (i = 0; i < MAX_OPERANDS; ++i)
 	    {
@@ -4389,7 +4518,7 @@ dofloat (int sizeflag)
 static void
 OP_ST (int bytemode ATTRIBUTE_UNUSED, int sizeflag ATTRIBUTE_UNUSED)
 {
-  oappend (&"%st"[(int)intel_syntax]);
+  oappend ("%st" + intel_syntax);
 }
 
 static void
@@ -4740,32 +4869,32 @@ append_seg (void)
   if (prefixes & PREFIX_CS)
     {
       used_prefixes |= PREFIX_CS;
-      oappend (INTEL_SYNTAX("%cs:"));
+      oappend ("%cs:" + intel_syntax);
     }
   if (prefixes & PREFIX_DS)
     {
       used_prefixes |= PREFIX_DS;
-      oappend (INTEL_SYNTAX("%ds:"));
+      oappend ("%ds:" + intel_syntax);
     }
   if (prefixes & PREFIX_SS)
     {
       used_prefixes |= PREFIX_SS;
-      oappend (INTEL_SYNTAX("%ss:"));
+      oappend ("%ss:" + intel_syntax);
     }
   if (prefixes & PREFIX_ES)
     {
       used_prefixes |= PREFIX_ES;
-      oappend (INTEL_SYNTAX("%es:"));
+      oappend ("%es:" + intel_syntax);
     }
   if (prefixes & PREFIX_FS)
     {
       used_prefixes |= PREFIX_FS;
-      oappend (INTEL_SYNTAX("%fs:"));
+      oappend ("%fs:" + intel_syntax);
     }
   if (prefixes & PREFIX_GS)
     {
       used_prefixes |= PREFIX_GS;
-      oappend (INTEL_SYNTAX("%gs:"));
+      oappend ("%gs:" + intel_syntax);
     }
 }
 
@@ -5296,6 +5425,17 @@ OP_G (int bytemode, int sizeflag)
     }
 }
 
+static void
+OP_vvvv (int bytemode, int sizeflags)
+{
+    USED_REX (REX_W);
+    if (rex & REX_W) {
+        oappend(names64[vex_reg]);
+    } else {
+        oappend(names32[vex_reg]);
+    }
+}
+
 static bfd_vma
 get64 (void)
 {
@@ -5815,7 +5955,7 @@ OP_ESreg (int code, int sizeflag)
 	  intel_operand_size (b_mode, sizeflag);
 	}
     }
-  oappend (INTEL_SYNTAX("%es:"));
+  oappend ("%es:" + intel_syntax);
   ptr_reg (code, sizeflag);
 }
 

@@ -10,72 +10,90 @@
  * FreeBSD.  They are fixed size, determined by the MTU,
  * so that one whole packet can fit.  Mbuf's cannot be
  * chained together.  If there's more data than the mbuf
- * could hold, an external malloced buffer is pointed to
+ * could hold, an external g_malloced buffer is pointed to
  * by m_ext (and the data pointers) and M_EXT is set in
  * the flags
  */
 
-#include <slirp.h>
+#include "qemu/osdep.h"
+#include "slirp.h"
 
-int mbuf_alloced = 0;
-struct mbuf m_freelist, m_usedlist;
 #define MBUF_THRESH 30
-int mbuf_max = 0;
 
 /*
  * Find a nice value for msize
- * XXX if_maxlinkhdr already in mtu
  */
-#define SLIRP_MSIZE (IF_MTU + IF_MAXLINKHDR + sizeof(struct m_hdr ) + 6)
+#define SLIRP_MSIZE\
+    (offsetof(struct mbuf, m_dat) + IF_MAXLINKHDR + TCPIPHDR_DELTA + IF_MTU)
 
 void
-m_init(void)
+m_init(Slirp *slirp)
 {
-	m_freelist.m_next = m_freelist.m_prev = &m_freelist;
-	m_usedlist.m_next = m_usedlist.m_prev = &m_usedlist;
+    slirp->m_freelist.qh_link = slirp->m_freelist.qh_rlink = &slirp->m_freelist;
+    slirp->m_usedlist.qh_link = slirp->m_usedlist.qh_rlink = &slirp->m_usedlist;
+}
+
+void m_cleanup(Slirp *slirp)
+{
+    struct mbuf *m, *next;
+
+    m = (struct mbuf *) slirp->m_usedlist.qh_link;
+    while ((struct quehead *) m != &slirp->m_usedlist) {
+        next = m->m_next;
+        if (m->m_flags & M_EXT) {
+            g_free(m->m_ext);
+        }
+        g_free(m);
+        m = next;
+    }
+    m = (struct mbuf *) slirp->m_freelist.qh_link;
+    while ((struct quehead *) m != &slirp->m_freelist) {
+        next = m->m_next;
+        g_free(m);
+        m = next;
+    }
 }
 
 /*
  * Get an mbuf from the free list, if there are none
- * malloc one
+ * allocate one
  *
  * Because fragmentation can occur if we alloc new mbufs and
  * free old mbufs, we mark all mbufs above mbuf_thresh as M_DOFREE,
- * which tells m_free to actually free() it
+ * which tells m_free to actually g_free() it
  */
 struct mbuf *
-m_get(void)
+m_get(Slirp *slirp)
 {
 	register struct mbuf *m;
 	int flags = 0;
 
 	DEBUG_CALL("m_get");
 
-	if (m_freelist.m_next == &m_freelist) {
-		m = (struct mbuf *)malloc(SLIRP_MSIZE);
-		if (m == NULL) goto end_error;
-		mbuf_alloced++;
-		if (mbuf_alloced > MBUF_THRESH)
+	if (slirp->m_freelist.qh_link == &slirp->m_freelist) {
+                m = g_malloc(SLIRP_MSIZE);
+		slirp->mbuf_alloced++;
+		if (slirp->mbuf_alloced > MBUF_THRESH)
 			flags = M_DOFREE;
-		if (mbuf_alloced > mbuf_max)
-			mbuf_max = mbuf_alloced;
+		m->slirp = slirp;
 	} else {
-		m = m_freelist.m_next;
+		m = (struct mbuf *) slirp->m_freelist.qh_link;
 		remque(m);
 	}
 
 	/* Insert it in the used list */
-	insque(m,&m_usedlist);
+	insque(m,&slirp->m_usedlist);
 	m->m_flags = (flags | M_USEDLIST);
 
 	/* Initialise it */
-	m->m_size = SLIRP_MSIZE - sizeof(struct m_hdr);
+	m->m_size = SLIRP_MSIZE - offsetof(struct mbuf, m_dat);
 	m->m_data = m->m_dat;
 	m->m_len = 0;
         m->m_nextpkt = NULL;
         m->m_prevpkt = NULL;
-end_error:
-	DEBUG_ARG("m = %lx", (long )m);
+        m->resolution_requested = false;
+        m->expiration_date = (uint64_t)-1;
+	DEBUG_ARG("m = %p", m);
 	return m;
 }
 
@@ -84,7 +102,7 @@ m_free(struct mbuf *m)
 {
 
   DEBUG_CALL("m_free");
-  DEBUG_ARG("m = %lx", (long )m);
+  DEBUG_ARG("m = %p", m);
 
   if(m) {
 	/* Remove from m_usedlist */
@@ -92,17 +110,17 @@ m_free(struct mbuf *m)
 	   remque(m);
 
 	/* If it's M_EXT, free() it */
-	if (m->m_flags & M_EXT)
-	   free(m->m_ext);
-
+        if (m->m_flags & M_EXT) {
+                g_free(m->m_ext);
+        }
 	/*
 	 * Either free() it or put it on the free list
 	 */
 	if (m->m_flags & M_DOFREE) {
-		free(m);
-		mbuf_alloced--;
+		m->slirp->mbuf_alloced--;
+                g_free(m);
 	} else if ((m->m_flags & M_FREELIST) == 0) {
-		insque(m,&m_freelist);
+		insque(m,&m->slirp->m_freelist);
 		m->m_flags = M_FREELIST; /* Clobber other flags */
 	}
   } /* if(m) */
@@ -110,7 +128,7 @@ m_free(struct mbuf *m)
 
 /*
  * Copy data from one mbuf to the end of
- * the other.. if result is too big for one mbuf, malloc()
+ * the other.. if result is too big for one mbuf, allocate
  * an M_EXT data segment
  */
 void
@@ -140,18 +158,12 @@ m_inc(struct mbuf *m, int size)
 
         if (m->m_flags & M_EXT) {
 	  datasize = m->m_data - m->m_ext;
-	  m->m_ext = (char *)realloc(m->m_ext,size);
-/*		if (m->m_ext == NULL)
- *			return (struct mbuf *)NULL;
- */
+          m->m_ext = g_realloc(m->m_ext, size);
 	  m->m_data = m->m_ext + datasize;
         } else {
 	  char *dat;
 	  datasize = m->m_data - m->m_dat;
-	  dat = (char *)malloc(size);
-/*		if (dat == NULL)
- *			return (struct mbuf *)NULL;
- */
+          dat = g_malloc(size);
 	  memcpy(dat, m->m_dat, m->m_size);
 
 	  m->m_ext = dat;
@@ -196,6 +208,31 @@ m_copy(struct mbuf *n, struct mbuf *m, int off, int len)
 	return 0;
 }
 
+/*
+ * Copy data from an mbuf chain starting "off" bytes from the beginning,
+ * continuing for "len" bytes, into the indicated buffer.
+ */
+void m_copydata(const struct mbuf *m, int off, int len, caddr_t cp) {
+	u_int count;
+
+	if (off < 0 || len < 0 || m == NULL) return;
+
+	while (off > 0) {
+		if (m == NULL || off < m->m_len) break;
+		off -= m->m_len;
+		m = m->m_next;
+	}
+	while (len > 0) {
+		if (m == NULL) break;
+
+		count = MIN(m->m_len - off, len);
+		memcpy(cp, mtod(m, caddr_t) + off, count);
+		len -= count;
+		cp += count;
+		off = 0;
+		m = m->m_next;
+	}
+}
 
 /*
  * Given a pointer into an mbuf, return the mbuf
@@ -203,15 +240,17 @@ m_copy(struct mbuf *n, struct mbuf *m, int off, int len)
  * Fortunately, it's not used often
  */
 struct mbuf *
-dtom(void *dat)
+dtom(Slirp *slirp, void *dat)
 {
 	struct mbuf *m;
 
 	DEBUG_CALL("dtom");
-	DEBUG_ARG("dat = %lx", (long )dat);
+	DEBUG_ARG("dat = %p", dat);
 
 	/* bug corrected for M_EXT buffers */
-	for (m = m_usedlist.m_next; m != &m_usedlist; m = m->m_next) {
+	for (m = (struct mbuf *) slirp->m_usedlist.qh_link;
+	     (struct quehead *) m != &slirp->m_usedlist;
+	     m = m->m_next) {
 	  if (m->m_flags & M_EXT) {
 	    if( (char *)dat>=m->m_ext && (char *)dat<(m->m_ext + m->m_size) )
 	      return m;

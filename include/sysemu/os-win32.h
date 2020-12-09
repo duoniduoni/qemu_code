@@ -26,88 +26,54 @@
 #ifndef QEMU_OS_WIN32_H
 #define QEMU_OS_WIN32_H
 
-#define socket_close  winsock2_socket_close3
-
 #include <winsock2.h>
 #include <windows.h>
+#include <ws2tcpip.h>
 
-#undef socket_close
+#define MAP_FAILED ((void*)(-1))
 
-/* Workaround for older versions of MinGW. */
-#ifndef ECONNREFUSED
-# define ECONNREFUSED WSAECONNREFUSED
-#endif
-#ifndef EINPROGRESS
-# define EINPROGRESS  WSAEINPROGRESS
-#endif
-#ifndef EHOSTUNREACH
-# define EHOSTUNREACH WSAEHOSTUNREACH
-#endif
-#ifndef EINTR
-# define EINTR        WSAEINTR
-#endif
-#ifndef EINPROGRESS
-# define EINPROGRESS  WSAEINPROGRESS
-#endif
-#ifndef ENETUNREACH
-# define ENETUNREACH  WSAENETUNREACH
-#endif
-#ifndef ENOTCONN
-# define ENOTCONN     WSAENOTCONN
-#endif
-#ifndef EWOULDBLOCK
-# define EWOULDBLOCK  WSAEWOULDBLOCK
-#endif
-
-#if defined(_WIN64)
-/* On w64, setjmp is implemented by _setjmp which needs a second parameter.
- * If this parameter is NULL, longjump does no stack unwinding.
- * That is what we need for QEMU. Passing the value of register rsp (default)
- * lets longjmp try a stack unwinding which will crash with generated code. */
-# undef setjmp
-# define setjmp(env) _setjmp(env, NULL)
-#endif
 /* QEMU uses sigsetjmp()/siglongjmp() as the portable way to specify
  * "longjmp and don't touch the signal masks". Since we know that the
  * savemask parameter will always be zero we can safely define these
  * in terms of setjmp/longjmp on Win32.
  */
 #define sigjmp_buf jmp_buf
+
+#ifndef _WIN64
+
 #define sigsetjmp(env, savemask) setjmp(env)
 #define siglongjmp(env, val) longjmp(env, val)
 
-/* Declaration of ffs() is missing in MinGW's strings.h. */
-int ffs(int i);
+#else
+
+/* On w64, setjmp implementation tends to crash in MinGW (there were several
+ * attempts to fix it, but it keeps crashing). The only good implementation
+ * is the GCC's undocumented builtins - so let's use them.
+ */
+# undef setjmp
+# undef longjmp
+# define setjmp __builtin_setjmp
+# define longjmp __builtin_longjmp
+# define sigsetjmp(x,y) __builtin_setjmp((x))
+# define siglongjmp(x,y) __builtin_longjmp((x),(y))
+
+#endif
 
 /* Missing POSIX functions. Don't use MinGW-w64 macros. */
+#ifndef CONFIG_LOCALTIME_R
 #undef gmtime_r
 struct tm *gmtime_r(const time_t *timep, struct tm *result);
 #undef localtime_r
 struct tm *localtime_r(const time_t *timep, struct tm *result);
-
-char *strtok_r(char *str, const char *delim, char **saveptr);
-
-/* Polling handling */
-
-/* return TRUE if no sleep should be done afterwards */
-typedef int PollingFunc(void *opaque);
-
-int qemu_add_polling_cb(PollingFunc *func, void *opaque);
-void qemu_del_polling_cb(PollingFunc *func, void *opaque);
-
-/* Wait objects handling */
-typedef void WaitObjectFunc(void *opaque);
-
-int qemu_add_wait_object(HANDLE handle, WaitObjectFunc *func, void *opaque);
-void qemu_del_wait_object(HANDLE handle, WaitObjectFunc *func, void *opaque);
-
-void os_host_main_loop_wait(int *timeout);
+#endif /* CONFIG_LOCALTIME_R */
 
 static inline void os_setup_signal_handling(void) {}
 static inline void os_daemonize(void) {}
 static inline void os_setup_post(void) {}
 void os_set_line_buffering(void);
 static inline void os_set_proc_name(const char *dummy) {}
+
+int getpagesize(void);
 
 #if !defined(EPROTONOSUPPORT)
 # define EPROTONOSUPPORT EINVAL
@@ -130,5 +96,139 @@ static inline int os_mlock(void)
 {
     return -ENOSYS;
 }
+
+#define fsync _commit
+
+#if !defined(lseek)
+# define lseek _lseeki64
+#endif
+
+int qemu_ftruncate64(int, int64_t);
+
+#if !defined(ftruncate)
+# define ftruncate qemu_ftruncate64
+#endif
+
+static inline char *realpath(const char *path, char *resolved_path)
+{
+    _fullpath(resolved_path, path, _MAX_PATH);
+    return resolved_path;
+}
+
+/* ??? Mingw appears to export _lock_file and _unlock_file as the functions
+ * with which to lock a stdio handle.  But something is wrong in the markup,
+ * either in the header or the library, such that we get undefined references
+ * to "_imp___lock_file" etc when linking.  Since we seem to have no other
+ * alternative, and the usage within the logging functions isn't critical,
+ * ignore FILE locking.
+ */
+
+static inline void qemu_flockfile(FILE *f)
+{
+}
+
+static inline void qemu_funlockfile(FILE *f)
+{
+}
+
+/* We wrap all the sockets functions so that we can
+ * set errno based on WSAGetLastError()
+ */
+
+#undef connect
+#define connect qemu_connect_wrap
+int qemu_connect_wrap(int sockfd, const struct sockaddr *addr,
+                      socklen_t addrlen);
+
+#undef listen
+#define listen qemu_listen_wrap
+int qemu_listen_wrap(int sockfd, int backlog);
+
+#undef bind
+#define bind qemu_bind_wrap
+int qemu_bind_wrap(int sockfd, const struct sockaddr *addr,
+                   socklen_t addrlen);
+
+#undef socket
+#define socket qemu_socket_wrap
+int qemu_socket_wrap(int domain, int type, int protocol);
+
+#undef accept
+#define accept qemu_accept_wrap
+int qemu_accept_wrap(int sockfd, struct sockaddr *addr,
+                     socklen_t *addrlen);
+
+#undef shutdown
+#define shutdown qemu_shutdown_wrap
+int qemu_shutdown_wrap(int sockfd, int how);
+
+#undef ioctlsocket
+#define ioctlsocket qemu_ioctlsocket_wrap
+int qemu_ioctlsocket_wrap(int fd, int req, void *val);
+
+#undef closesocket
+#define closesocket qemu_closesocket_wrap
+int qemu_closesocket_wrap(int fd);
+
+#undef getsockopt
+#define getsockopt qemu_getsockopt_wrap
+int qemu_getsockopt_wrap(int sockfd, int level, int optname,
+                         void *optval, socklen_t *optlen);
+
+#undef setsockopt
+#define setsockopt qemu_setsockopt_wrap
+int qemu_setsockopt_wrap(int sockfd, int level, int optname,
+                         const void *optval, socklen_t optlen);
+
+#undef getpeername
+#define getpeername qemu_getpeername_wrap
+int qemu_getpeername_wrap(int sockfd, struct sockaddr *addr,
+                          socklen_t *addrlen);
+
+#undef getsockname
+#define getsockname qemu_getsockname_wrap
+int qemu_getsockname_wrap(int sockfd, struct sockaddr *addr,
+                          socklen_t *addrlen);
+
+#undef send
+#define send qemu_send_wrap
+ssize_t qemu_send_wrap(int sockfd, const void *buf, size_t len, int flags);
+
+#undef sendto
+#define sendto qemu_sendto_wrap
+ssize_t qemu_sendto_wrap(int sockfd, const void *buf, size_t len, int flags,
+                         const struct sockaddr *addr, socklen_t addrlen);
+
+#undef recv
+#define recv qemu_recv_wrap
+ssize_t qemu_recv_wrap(int sockfd, void *buf, size_t len, int flags);
+
+#undef recvfrom
+#define recvfrom qemu_recvfrom_wrap
+ssize_t qemu_recvfrom_wrap(int sockfd, void *buf, size_t len, int flags,
+                           struct sockaddr *addr, socklen_t *addrlen);
+
+// ANDROID_BEGIN
+/* These are wrappers around Win32 functions. When building against the
+ * Android emulator, they will treat file names as UTF-8 encoded strings,
+ * instead of ANSI ones. */
+HANDLE win32CreateFile(
+        LPCTSTR               lpFileName,
+        DWORD                 dwDesiredAccess,
+        DWORD                 dwShareMode,
+        LPSECURITY_ATTRIBUTES lpSecurityAttributes,
+        DWORD                 dwCreationDisposition,
+        DWORD                 dwFlagsAndAttributes,
+        HANDLE                hTemplateFile);
+
+DWORD win32GetCurrentDirectory(
+        DWORD  nBufferLength,
+        LPTSTR lpBuffer);
+
+DWORD win32GetModuleFileName(
+        HMODULE hModule,
+        LPTSTR  lpFilename,
+        DWORD   nSize);
+// ANDROID_END
 
 #endif

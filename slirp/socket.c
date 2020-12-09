@@ -5,9 +5,11 @@
  * terms and conditions of the copyright.
  */
 
+#include "qemu/osdep.h"
 #include "qemu-common.h"
-#include <slirp.h>
+#include "slirp.h"
 #include "ip_icmp.h"
+#include "proxy.h"
 #ifdef __sun__
 #include <sys/filio.h>
 #endif
@@ -15,32 +17,26 @@
 static void sofcantrcvmore(struct socket *so);
 static void sofcantsendmore(struct socket *so);
 
-#if 0
-static void
-so_init()
+struct socket *solookup(struct socket **last, struct socket *head,
+        struct sockaddr_storage *lhost, struct sockaddr_storage *fhost)
 {
-	/* Nothing yet */
-}
-#endif
+    struct socket *so = *last;
 
-struct socket *
-solookup(struct socket *head, struct in_addr laddr, u_int lport,
-         struct in_addr faddr, u_int fport)
-{
-	struct socket *so;
+    /* Optimization */
+    if (so != head && sockaddr_equal(&(so->lhost.ss), lhost)
+            && (!fhost || sockaddr_equal(&so->fhost.ss, fhost))) {
+        return so;
+    }
 
-	for (so = head->so_next; so != head; so = so->so_next) {
-		if (so->so_lport == lport &&
-		    so->so_laddr.s_addr == laddr.s_addr &&
-		    so->so_faddr.s_addr == faddr.s_addr &&
-		    so->so_fport == fport)
-		   break;
-	}
+    for (so = head->so_next; so != head; so = so->so_next) {
+        if (sockaddr_equal(&(so->lhost.ss), lhost)
+                && (!fhost || sockaddr_equal(&so->fhost.ss, fhost))) {
+            *last = so;
+            return so;
+        }
+    }
 
-	if (so == head)
-	   return (struct socket *)NULL;
-	return so;
-
+    return (struct socket *)NULL;
 }
 
 /*
@@ -49,7 +45,7 @@ solookup(struct socket *head, struct in_addr laddr, u_int lport,
  * insque() it into the correct linked-list
  */
 struct socket *
-socreate(void)
+socreate(Slirp *slirp)
 {
   struct socket *so;
 
@@ -58,8 +54,31 @@ socreate(void)
     memset(so, 0, sizeof(struct socket));
     so->so_state = SS_NOFDREF;
     so->s = -1;
+    so->slirp = slirp;
+    so->pollfds_idx = -1;
   }
   return(so);
+}
+
+/*
+ * Remove references to so from the given message queue.
+ */
+static void
+soqfree(struct socket *so, struct quehead *qh)
+{
+    struct mbuf *ifq;
+
+    for (ifq = (struct mbuf *) qh->qh_link;
+             (struct quehead *) ifq != qh;
+             ifq = ifq->ifq_next) {
+        if (ifq->ifq_so == so) {
+            struct mbuf *ifm;
+            ifq->ifq_so = NULL;
+            for (ifm = ifq->ifs_next; ifm != ifq; ifm = ifm->ifs_next) {
+                ifm->ifq_so = NULL;
+            }
+        }
+    }
 }
 
 /*
@@ -68,20 +87,34 @@ socreate(void)
 void
 sofree(struct socket *so)
 {
+  Slirp *slirp = so->slirp;
+
+  soqfree(so, &slirp->if_fastq);
+  soqfree(so, &slirp->if_batchq);
+
+  if (so->so_state) {
+	slirp_proxy->remove(so);
+  }
+
   if (so->so_emu==EMU_RSH && so->extra) {
 	sofree(so->extra);
 	so->extra=NULL;
   }
-  if (so == tcp_last_so)
-    tcp_last_so = &tcb;
-  else if (so == udp_last_so)
-    udp_last_so = &udb;
-
+  if (so == slirp->tcp_last_so) {
+      slirp->tcp_last_so = &slirp->tcb;
+  } else if (so == slirp->udp_last_so) {
+      slirp->udp_last_so = &slirp->udb;
+  } else if (so == slirp->icmp_last_so) {
+      slirp->icmp_last_so = &slirp->icmp;
+  }
   m_free(so->so_m);
 
   if(so->so_next && so->so_prev)
     remque(so);  /* crashes if so is not in a queue */
 
+  if (so->so_tcpcb) {
+      free(so->so_tcpcb);
+  }
   free(so);
 }
 
@@ -93,9 +126,7 @@ size_t sopreprbuf(struct socket *so, struct iovec *iov, int *np)
 	int mss = so->so_tcpcb->t_maxseg;
 
 	DEBUG_CALL("sopreprbuf");
-	DEBUG_ARG("so = %lx", (long )so);
-
-	len = sb->sb_datalen - sb->sb_cc;
+	DEBUG_ARG("so = %p", so);
 
 	if (len <= 0)
 		return 0;
@@ -154,12 +185,12 @@ size_t sopreprbuf(struct socket *so, struct iovec *iov, int *np)
 int
 soread(struct socket *so)
 {
-	int n, nn;
+    int n = 0, nn;
 	struct sbuf *sb = &so->so_snd;
-	struct iovec iov[2];
+    struct iovec iov[2] = {};
 
 	DEBUG_CALL("soread");
-	DEBUG_ARG("so = %lx", (long )so);
+	DEBUG_ARG("so = %p", so);
 
 	/*
 	 * No need to check if there's enough room to read.
@@ -171,15 +202,30 @@ soread(struct socket *so)
 	nn = readv(so->s, (struct iovec *)iov, n);
 	DEBUG_MISC((dfd, " ... read nn = %d bytes\n", nn));
 #else
-	nn = recv(so->s, iov[0].iov_base, iov[0].iov_len,0);
+	nn = qemu_recv(so->s, iov[0].iov_base, iov[0].iov_len,0);
 #endif
 	if (nn <= 0) {
 		if (nn < 0 && (errno == EINTR || errno == EAGAIN))
 			return 0;
 		else {
+			int err;
+			socklen_t slen = sizeof err;
+
+			err = errno;
+			if (nn == 0) {
+				getsockopt(so->s, SOL_SOCKET, SO_ERROR,
+					   &err, &slen);
+			}
+
 			DEBUG_MISC((dfd, " --- soread() disconnected, nn = %d, errno = %d-%s\n", nn, errno,strerror(errno)));
 			sofcantrcvmore(so);
-			tcp_sockclosed(sototcpcb(so));
+
+			if (err == ECONNRESET || err == ECONNREFUSED
+			    || err == ENOTCONN || err == EPIPE) {
+				tcp_drop(sototcpcb(so), err);
+			} else {
+				tcp_sockclosed(sototcpcb(so));
+			}
 			return -1;
 		}
 	}
@@ -192,11 +238,11 @@ soread(struct socket *so)
 	 * We don't test for <= 0 this time, because there legitimately
 	 * might not be any more data (since the socket is non-blocking),
 	 * a close will be detected on next iteration.
-	 * A return of -1 wont (shouldn't) happen, since it didn't happen above
+	 * A return of -1 won't (shouldn't) happen, since it didn't happen above
 	 */
 	if (n == 2 && nn == iov[0].iov_len) {
             int ret;
-            ret = recv(so->s, iov[1].iov_base, iov[1].iov_len,0);
+            ret = qemu_recv(so->s, iov[1].iov_base, iov[1].iov_len,0);
             if (ret > 0)
                 nn += ret;
         }
@@ -214,12 +260,12 @@ soread(struct socket *so)
 
 int soreadbuf(struct socket *so, const char *buf, int size)
 {
-    int n, nn, copy = size;
+    int n = 0, nn, copy = size;
 	struct sbuf *sb = &so->so_snd;
-	struct iovec iov[2];
+    struct iovec iov[2] = {};
 
 	DEBUG_CALL("soreadbuf");
-	DEBUG_ARG("so = %lx", (long )so);
+	DEBUG_ARG("so = %p", so);
 
 	/*
 	 * No need to check if there's enough room to read.
@@ -261,13 +307,14 @@ err:
  * so when OOB data arrives, we soread() it and everything
  * in the send buffer is sent as urgent data
  */
-void
+int
 sorecvoob(struct socket *so)
 {
 	struct tcpcb *tp = sototcpcb(so);
+	int ret;
 
 	DEBUG_CALL("sorecvoob");
-	DEBUG_ARG("so = %lx", (long)so);
+	DEBUG_ARG("so = %p", so);
 
 	/*
 	 * We take a guess at how much urgent data has arrived.
@@ -277,11 +324,15 @@ sorecvoob(struct socket *so)
 	 * urgent data, or the read() doesn't return all the
 	 * urgent data.
 	 */
-	soread(so);
-	tp->snd_up = tp->snd_una + so->so_snd.sb_cc;
-	tp->t_force = 1;
-	tcp_output(tp);
-	tp->t_force = 0;
+	ret = soread(so);
+	if (ret > 0) {
+	    tp->snd_up = tp->snd_una + so->so_snd.sb_cc;
+	    tp->t_force = 1;
+	    tcp_output(tp);
+	    tp->t_force = 0;
+	}
+
+	return ret;
 }
 
 /*
@@ -297,7 +348,7 @@ sosendoob(struct socket *so)
 	int n, len;
 
 	DEBUG_CALL("sosendoob");
-	DEBUG_ARG("so = %lx", (long)so);
+	DEBUG_ARG("so = %p", so);
 	DEBUG_ARG("sb->sb_cc = %d", sb->sb_cc);
 
 	if (so->so_urgc > 2048)
@@ -306,33 +357,40 @@ sosendoob(struct socket *so)
 	if (sb->sb_rptr < sb->sb_wptr) {
 		/* We can send it directly */
 		n = slirp_send(so, sb->sb_rptr, so->so_urgc, (MSG_OOB)); /* |MSG_DONTWAIT)); */
-		so->so_urgc -= n;
-
-		DEBUG_MISC((dfd, " --- sent %d bytes urgent data, %d urgent bytes left\n", n, so->so_urgc));
 	} else {
 		/*
 		 * Since there's no sendv or sendtov like writev,
 		 * we must copy all data to a linear buffer then
 		 * send it all
 		 */
+		uint32_t urgc = so->so_urgc;
 		len = (sb->sb_data + sb->sb_datalen) - sb->sb_rptr;
-		if (len > so->so_urgc) len = so->so_urgc;
+		if (len > urgc) {
+			len = urgc;
+		}
 		memcpy(buff, sb->sb_rptr, len);
-		so->so_urgc -= len;
-		if (so->so_urgc) {
+		urgc -= len;
+		if (urgc) {
 			n = sb->sb_wptr - sb->sb_data;
-			if (n > so->so_urgc) n = so->so_urgc;
+			if (n > urgc) {
+				n = urgc;
+			}
 			memcpy((buff + len), sb->sb_data, n);
-			so->so_urgc -= n;
 			len += n;
 		}
 		n = slirp_send(so, buff, len, (MSG_OOB)); /* |MSG_DONTWAIT)); */
-#ifdef DEBUG
-		if (n != len)
-		   DEBUG_ERROR((dfd, "Didn't send all data urgently XXXXX\n"));
-#endif
-		DEBUG_MISC((dfd, " ---2 sent %d bytes urgent data, %d urgent bytes left\n", n, so->so_urgc));
 	}
+
+#ifdef DEBUG
+	if (n != len) {
+		DEBUG_ERROR((dfd, "Didn't send all data urgently XXXXX\n"));
+	}
+#endif
+	if (n < 0) {
+		return n;
+	}
+	so->so_urgc -= n;
+	DEBUG_MISC((dfd, " ---2 sent %d bytes urgent data, %d urgent bytes left\n", n, so->so_urgc));
 
 	sb->sb_cc -= n;
 	sb->sb_rptr += n;
@@ -355,10 +413,18 @@ sowrite(struct socket *so)
 	struct iovec iov[2];
 
 	DEBUG_CALL("sowrite");
-	DEBUG_ARG("so = %lx", (long)so);
+	DEBUG_ARG("so = %p", so);
 
 	if (so->so_urgc) {
-		sosendoob(so);
+		uint32_t expected = so->so_urgc;
+		if (sosendoob(so) < expected) {
+			/* Treat a short write as a fatal error too,
+			 * rather than continuing on and sending the urgent
+			 * data as if it were non-urgent and leaving the
+			 * so_urgc count wrong.
+			 */
+			goto err_disconnected;
+		}
 		if (sb->sb_cc == 0)
 			return 0;
 	}
@@ -367,8 +433,6 @@ sowrite(struct socket *so)
 	 * No need to check if there's something to write,
 	 * sowrite wouldn't have been called otherwise
 	 */
-
-        len = sb->sb_cc;
 
 	iov[0].iov_base = sb->sb_rptr;
         iov[1].iov_base = NULL;
@@ -404,11 +468,7 @@ sowrite(struct socket *so)
 		return 0;
 
 	if (nn <= 0) {
-		DEBUG_MISC((dfd, " --- sowrite disconnected, so->so_state = %x, errno = %d\n",
-			so->so_state, errno));
-		sofcantsendmore(so);
-		tcp_sockclosed(sototcpcb(so));
-		return -1;
+		goto err_disconnected;
 	}
 
 #ifndef HAVE_READV
@@ -435,6 +495,13 @@ sowrite(struct socket *so)
 		sofcantsendmore(so);
 
 	return nn;
+
+err_disconnected:
+	DEBUG_MISC((dfd, " --- sowrite disconnected, so->so_state = %x, errno = %d\n",
+		    so->so_state, errno));
+	sofcantsendmore(so);
+	tcp_sockclosed(sototcpcb(so));
+	return -1;
 }
 
 /*
@@ -443,11 +510,12 @@ sowrite(struct socket *so)
 void
 sorecvfrom(struct socket *so)
 {
-	struct sockaddr_in addr;
-	socklen_t addrlen = sizeof(struct sockaddr_in);
+	struct sockaddr_storage addr;
+	struct sockaddr_storage saddr, daddr;
+	socklen_t addrlen = sizeof(struct sockaddr_storage);
 
 	DEBUG_CALL("sorecvfrom");
-	DEBUG_ARG("so = %lx", (long)so);
+	DEBUG_ARG("so = %p", so);
 
 	if (so->so_type == IPPROTO_ICMP) {   /* This is a "ping" reply */
 	  char buff[256];
@@ -465,7 +533,7 @@ sorecvfrom(struct socket *so)
 
 	    DEBUG_MISC((dfd," udp icmp rx errno = %d-%s\n",
 			errno,strerror(errno)));
-	    icmp_error(so->so_m, ICMP_UNREACH,code, 0,strerror(errno));
+	    icmp_send_error(so->so_m, ICMP_UNREACH, code, 0, strerror(errno));
 	  } else {
 	    icmp_reflect(so->so_m);
             so->so_m = NULL; /* Don't m_free() it again! */
@@ -481,8 +549,22 @@ sorecvfrom(struct socket *so)
           int n;
 #endif
 
-	  if (!(m = m_get())) return;
-	  m->m_data += IF_MAXLINKHDR;
+	  m = m_get(so->slirp);
+	  if (!m) {
+	      return;
+	  }
+	  switch (so->so_ffamily) {
+	  case AF_INET:
+	      m->m_data += IF_MAXLINKHDR + sizeof(struct udpiphdr);
+	      break;
+	  case AF_INET6:
+	      m->m_data += IF_MAXLINKHDR + sizeof(struct ip6)
+	                                 + sizeof(struct udphdr);
+	      break;
+	  default:
+	      g_assert_not_reached();
+	      break;
+	  }
 
 	  /*
 	   * XXX Shouldn't FIONREAD packets destined for port 53,
@@ -504,13 +586,37 @@ sorecvfrom(struct socket *so)
 	  DEBUG_MISC((dfd, " did recvfrom %d, errno = %d-%s\n",
 		      m->m_len, errno,strerror(errno)));
 	  if(m->m_len<0) {
-	    u_char code=ICMP_UNREACH_PORT;
+	    /* Report error as ICMP */
+	    switch (so->so_lfamily) {
+	    uint8_t code;
+	    case AF_INET:
+	      code = ICMP_UNREACH_PORT;
 
-	    if(errno == EHOSTUNREACH) code=ICMP_UNREACH_HOST;
-	    else if(errno == ENETUNREACH) code=ICMP_UNREACH_NET;
+	      if (errno == EHOSTUNREACH) {
+		code = ICMP_UNREACH_HOST;
+	      } else if (errno == ENETUNREACH) {
+		code = ICMP_UNREACH_NET;
+	      }
 
-	    DEBUG_MISC((dfd," rx error, tx icmp ICMP_UNREACH:%i\n", code));
-	    icmp_error(so->so_m, ICMP_UNREACH,code, 0,strerror(errno));
+	      DEBUG_MISC((dfd, " rx error, tx icmp ICMP_UNREACH:%i\n", code));
+	      icmp_send_error(so->so_m, ICMP_UNREACH, code, 0, strerror(errno));
+	      break;
+	    case AF_INET6:
+	      code = ICMP6_UNREACH_PORT;
+
+	      if (errno == EHOSTUNREACH) {
+		code = ICMP6_UNREACH_ADDRESS;
+	      } else if (errno == ENETUNREACH) {
+		code = ICMP6_UNREACH_NO_ROUTE;
+	      }
+
+	      DEBUG_MISC((dfd, " rx error, tx icmp6 ICMP_UNREACH:%i\n", code));
+	      icmp6_send_error(so->so_m, ICMP6_UNREACH, code);
+	      break;
+	    default:
+	      g_assert_not_reached();
+	      break;
+	    }
 	    m_free(m);
 	  } else {
 	  /*
@@ -520,23 +626,34 @@ sorecvfrom(struct socket *so)
 	   * out much quicker (10 seconds  for now...)
 	   */
 	    if (so->so_expire) {
-	      if (so->so_fport == htons(53))
+	      if (so->so_fport == htons(kDnsPort))
 		so->so_expire = curtime + SO_EXPIREFAST;
 	      else
 		so->so_expire = curtime + SO_EXPIRE;
 	    }
 
-	    /*		if (m->m_len == len) {
-	     *			m_inc(m, MINCSIZE);
-	     *			m->m_len = 0;
-	     *		}
-	     */
-
 	    /*
 	     * If this packet was destined for CTL_ADDR,
-	     * make it look like that's where it came from, done by udp_output
+	     * make it look like that's where it came from
 	     */
-	    udp_output(so, m, &addr);
+	    saddr = addr;
+	    sotranslate_in(so, &saddr);
+	    daddr = so->lhost.ss;
+
+	    switch (so->so_ffamily) {
+	    case AF_INET:
+	        udp_output(so, m, (struct sockaddr_in *) &saddr,
+	                   (struct sockaddr_in *) &daddr,
+	                   so->so_iptos);
+	        break;
+	    case AF_INET6:
+	        udp6_output(so, m, (struct sockaddr_in6 *) &saddr,
+	                    (struct sockaddr_in6 *) &daddr);
+	        break;
+	    default:
+	        g_assert_not_reached();
+	        break;
+	    }
 	  } /* rx error */
 	} /* if ping packet */
 }
@@ -548,33 +665,20 @@ int
 sosendto(struct socket *so, struct mbuf *m)
 {
 	int ret;
-	struct sockaddr_in addr;
+	struct sockaddr_storage addr;
 
 	DEBUG_CALL("sosendto");
-	DEBUG_ARG("so = %lx", (long)so);
-	DEBUG_ARG("m = %lx", (long)m);
+	DEBUG_ARG("so = %p", so);
+	DEBUG_ARG("m = %p", m);
 
-        addr.sin_family = AF_INET;
-	if ((so->so_faddr.s_addr & htonl(0xffffff00)) == special_addr.s_addr) {
-	  /* It's an alias */
-	  switch(ntohl(so->so_faddr.s_addr) & 0xff) {
-	  case CTL_DNS:
-	    addr.sin_addr = dns_addr;
-	    break;
-	  case CTL_ALIAS:
-	  default:
-	    addr.sin_addr = loopback_addr;
-	    break;
-	  }
-	} else
-	  addr.sin_addr = so->so_faddr;
-	addr.sin_port = so->so_fport;
-
-	DEBUG_MISC((dfd, " sendto()ing, addr.sin_port=%d, addr.sin_addr.s_addr=%.16s\n", ntohs(addr.sin_port), inet_ntoa(addr.sin_addr)));
+	addr = so->fhost.ss;
+	DEBUG_CALL(" sendto()ing)");
+	sotranslate_out(so, &addr);
+        udp_reattach(so, addr.ss_family);
 
 	/* Don't care what port we get */
 	ret = sendto(so->s, m->m_data, m->m_len, 0,
-		     (struct sockaddr *)&addr, sizeof (struct sockaddr));
+		     (struct sockaddr *)&addr, sockaddr_size(&addr));
 	if (ret < 0)
 		return -1;
 
@@ -584,29 +688,33 @@ sosendto(struct socket *so, struct mbuf *m)
 	 */
 	if (so->so_expire)
 		so->so_expire = curtime + SO_EXPIRE;
-	so->so_state = SS_ISFCONNECTED; /* So that it gets select()ed */
+	so->so_state &= SS_PERSISTENT_MASK;
+	so->so_state |= SS_ISFCONNECTED; /* So that it gets select()ed */
 	return 0;
 }
 
 /*
- * XXX This should really be tcp_listen
+ * Listen for incoming TCP connections
  */
 struct socket *
-solisten(u_int port, u_int32_t laddr, u_int lport, int flags)
+tcp_listen(Slirp *slirp, uint32_t haddr, u_int hport, uint32_t laddr,
+           u_int lport, int flags)
 {
 	struct sockaddr_in addr;
 	struct socket *so;
 	int s, opt = 1;
 	socklen_t addrlen = sizeof(addr);
+	memset(&addr, 0, addrlen);
 
-	DEBUG_CALL("solisten");
-	DEBUG_ARG("port = %d", port);
+	DEBUG_CALL("tcp_listen");
+	DEBUG_ARG("haddr = %x", haddr);
+	DEBUG_ARG("hport = %d", hport);
 	DEBUG_ARG("laddr = %x", laddr);
 	DEBUG_ARG("lport = %d", lport);
 	DEBUG_ARG("flags = %x", flags);
 
-	if ((so = socreate()) == NULL) {
-	  /* free(so);      Not sofree() ??? free(NULL) == NOP */
+	so = socreate(slirp);
+	if (!so) {
 	  return NULL;
 	}
 
@@ -615,7 +723,7 @@ solisten(u_int port, u_int32_t laddr, u_int lport, int flags)
 		free(so);
 		return NULL;
 	}
-	insque(so,&tcb);
+	insque(so, &slirp->tcb);
 
 	/*
 	 * SS_FACCEPTONCE sockets must time out.
@@ -623,21 +731,25 @@ solisten(u_int port, u_int32_t laddr, u_int lport, int flags)
 	if (flags & SS_FACCEPTONCE)
 	   so->so_tcpcb->t_timer[TCPT_KEEP] = TCPTV_KEEP_INIT*2;
 
-	so->so_state = (SS_FACCEPTCONN|flags);
+	so->so_state &= SS_PERSISTENT_MASK;
+	so->so_state |= (SS_FACCEPTCONN | flags);
+	so->so_lfamily = AF_INET;
 	so->so_lport = lport; /* Kept in network format */
 	so->so_laddr.s_addr = laddr; /* Ditto */
 
 	addr.sin_family = AF_INET;
-	addr.sin_addr.s_addr = INADDR_ANY;
-	addr.sin_port = port;
+	addr.sin_addr.s_addr = haddr;
+	addr.sin_port = hport;
 
-	if (((s = socket(AF_INET,SOCK_STREAM,0)) < 0) ||
-	    (setsockopt(s,SOL_SOCKET,SO_REUSEADDR,(char *)&opt,sizeof(int)) < 0) ||
+	if (((s = qemu_socket(AF_INET,SOCK_STREAM,0)) < 0) ||
+	    (socket_set_fast_reuse(s) < 0) ||
 	    (bind(s,(struct sockaddr *)&addr, sizeof(addr)) < 0) ||
 	    (listen(s,1) < 0)) {
 		int tmperrno = errno; /* Don't clobber the real reason we failed */
 
-		close(s);
+                if (s >= 0) {
+                    closesocket(s);
+                }
 		sofree(so);
 		/* Restore the real errno */
 #ifdef _WIN32
@@ -647,45 +759,19 @@ solisten(u_int port, u_int32_t laddr, u_int lport, int flags)
 #endif
 		return NULL;
 	}
-	setsockopt(s,SOL_SOCKET,SO_OOBINLINE,(char *)&opt,sizeof(int));
+	qemu_setsockopt(s, SOL_SOCKET, SO_OOBINLINE, &opt, sizeof(int));
 
 	getsockname(s,(struct sockaddr *)&addr,&addrlen);
+	so->so_ffamily = AF_INET;
 	so->so_fport = addr.sin_port;
 	if (addr.sin_addr.s_addr == 0 || addr.sin_addr.s_addr == loopback_addr.s_addr)
-	   so->so_faddr = alias_addr;
+	   so->so_faddr = slirp->vhost_addr;
 	else
 	   so->so_faddr = addr.sin_addr;
 
 	so->s = s;
 	return so;
 }
-
-#if 0
-/*
- * Data is available in so_rcv
- * Just write() the data to the socket
- * XXX not yet...
- */
-static void
-sorwakeup(so)
-	struct socket *so;
-{
-/*	sowrite(so); */
-/*	FD_CLR(so->s,&writefds); */
-}
-
-/*
- * Data has been freed in so_snd
- * We have room for a read() if we want to
- * For now, don't read, it'll be done in the main loop
- */
-static void
-sowwakeup(so)
-	struct socket *so;
-{
-	/* Nothing, yet */
-}
-#endif
 
 /*
  * Various session state calls
@@ -713,15 +799,14 @@ sofcantrcvmore(struct socket *so)
 {
 	if ((so->so_state & SS_NOFDREF) == 0) {
 		shutdown(so->s,0);
-		if(global_writefds) {
-		  FD_CLR(so->s,global_writefds);
-		}
 	}
 	so->so_state &= ~(SS_ISFCONNECTING);
-	if (so->so_state & SS_FCANTSENDMORE)
-	   so->so_state = SS_NOFDREF; /* Don't select it */ /* XXX close() here as well? */
-	else
+	if (so->so_state & SS_FCANTSENDMORE) {
+	   so->so_state &= SS_PERSISTENT_MASK;
+	   so->so_state |= SS_NOFDREF; /* Don't select it */
+	} else {
 	   so->so_state |= SS_FCANTRCVMORE;
+	}
 }
 
 static void
@@ -729,29 +814,14 @@ sofcantsendmore(struct socket *so)
 {
 	if ((so->so_state & SS_NOFDREF) == 0) {
             shutdown(so->s,1);           /* send FIN to fhost */
-            if (global_readfds) {
-                FD_CLR(so->s,global_readfds);
-            }
-            if (global_xfds) {
-                FD_CLR(so->s,global_xfds);
-            }
 	}
 	so->so_state &= ~(SS_ISFCONNECTING);
-	if (so->so_state & SS_FCANTRCVMORE)
-	   so->so_state = SS_NOFDREF; /* as above */
-	else
+	if (so->so_state & SS_FCANTRCVMORE) {
+	   so->so_state &= SS_PERSISTENT_MASK;
+	   so->so_state |= SS_NOFDREF; /* as above */
+	} else {
 	   so->so_state |= SS_FCANTSENDMORE;
-}
-
-void
-soisfdisconnected(struct socket *so)
-{
-/*	so->so_state &= ~(SS_ISFCONNECTING|SS_ISFCONNECTED); */
-/*	close(so->s); */
-/*	so->so_state = SS_ISFDISCONNECTED; */
-	/*
-	 * XXX Do nothing ... ?
-	 */
+	}
 }
 
 /*
@@ -766,3 +836,134 @@ sofwdrain(struct socket *so)
 	else
 		sofcantsendmore(so);
 }
+
+/*
+ * Translate addr in host addr when it is a virtual address
+ */
+void sotranslate_out(struct socket *so, struct sockaddr_storage *addr)
+{
+    Slirp *slirp = so->slirp;
+    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+
+    switch (addr->ss_family) {
+    case AF_INET:
+        if ((so->so_faddr.s_addr & slirp->vnetwork_mask.s_addr) ==
+                slirp->vnetwork_addr.s_addr) {
+            if (so->so_faddr.s_addr == slirp->vhost_addr.s_addr ||
+                slirp_translate_guest_dns(slirp, &so->fhost.sin, addr) < 0) {
+                sin->sin_addr = loopback_addr;
+            }
+        }
+
+        DEBUG_MISC((dfd, " addr.sin_port=%d, "
+            "addr.sin_addr.s_addr=%.16s\n",
+            ntohs(sin->sin_port), inet_ntoa(sin->sin_addr)));
+        break;
+
+    case AF_INET6:
+        if (in6_equal_net(&so->so_faddr6, &slirp->vprefix_addr6,
+                    slirp->vprefix_len)) {
+          if (in6_equal_mach(&so->so_faddr6, &slirp->vhost_addr6,
+                             slirp->vprefix_len) ||
+              slirp_translate_guest_dns6(slirp, &so->fhost.sin6, addr) < 0) {
+                sin6->sin6_addr = in6addr_loopback;
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+void sotranslate_in(struct socket *so, struct sockaddr_storage *addr)
+{
+    Slirp *slirp = so->slirp;
+    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+    struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr;
+
+    switch (so->so_ffamily) {
+    case AF_INET:
+        if ((so->so_faddr.s_addr & slirp->vnetwork_mask.s_addr) ==
+            slirp->vnetwork_addr.s_addr) {
+            uint32_t inv_mask = ~slirp->vnetwork_mask.s_addr;
+
+            if ((so->so_faddr.s_addr & inv_mask) == inv_mask) {
+                sin->sin_addr = slirp->vhost_addr;
+            } else if (sin->sin_addr.s_addr == loopback_addr.s_addr ||
+                       so->so_faddr.s_addr != slirp->vhost_addr.s_addr) {
+                sin->sin_addr = so->so_faddr;
+            }
+        }
+        break;
+
+    case AF_INET6:
+        if (in6_equal_net(&so->so_faddr6, &slirp->vprefix_addr6,
+                    slirp->vprefix_len)) {
+            if (in6_equal(&sin6->sin6_addr, &in6addr_loopback)
+                    || !in6_equal(&so->so_faddr6, &slirp->vhost_addr6)) {
+                sin6->sin6_addr = so->so_faddr6;
+            }
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+/*
+ * Translate connections from localhost to the real hostname
+ */
+void sotranslate_accept(struct socket *so)
+{
+    Slirp *slirp = so->slirp;
+
+    switch (so->so_ffamily) {
+    case AF_INET:
+        if (so->so_faddr.s_addr == INADDR_ANY ||
+            (so->so_faddr.s_addr & loopback_mask) ==
+            (loopback_addr.s_addr & loopback_mask)) {
+           so->so_faddr = slirp->vhost_addr;
+        }
+        break;
+
+   case AF_INET6:
+        if (in6_equal(&so->so_faddr6, &in6addr_any) ||
+                in6_equal(&so->so_faddr6, &in6addr_loopback)) {
+           so->so_faddr6 = slirp->vhost_addr6;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+const char* sockaddr_to_string(const struct sockaddr_storage* ss) {
+    static char result[128];
+    char temp[128];
+    int port = 0;
+    switch (ss->ss_family) {
+        case AF_INET: {
+            struct sockaddr_in *sin = (struct sockaddr_in *)ss;
+            inet_ntop(AF_INET, &sin->sin_addr, temp, sizeof(temp));
+            port = ntohs(sin->sin_port);
+            break;
+        }
+        case AF_INET6: {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)ss;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, temp, sizeof(temp));
+            port = ntohs(sin6->sin6_port);
+            break;
+        }
+        default:
+            return NULL;
+    }
+    snprintf(result, sizeof(result), "%s:%d", temp, port);
+    return result;
+}
+
+const struct SlirpProxyOps *slirp_proxy;
+bool http_proxy_on = false;

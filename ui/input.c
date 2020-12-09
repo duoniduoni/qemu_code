@@ -1,308 +1,572 @@
-/*
- * QEMU System Emulator
- *
- * Copyright (c) 2003-2008 Fabrice Bellard
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL
- * THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
-
+#include "qemu/osdep.h"
 #include "sysemu/sysemu.h"
-#include "net/net.h"
-#include "monitor/monitor.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-ui.h"
+#include "qapi/qmp/qdict.h"
+#include "qemu/error-report.h"
+#include "trace.h"
+#include "ui/input.h"
 #include "ui/console.h"
-#include "qapi/qmp/qjson.h"
+#include "sysemu/replay.h"
 
-#ifdef CONFIG_SKINNING
-QEMUPutMouseEntry *original_qemu_add_mouse_event_handler(QEMUPutMouseEvent *func,
-                                                         void *opaque, int absolute,
-                                                         const char *name);
-#undef qemu_add_mouse_event_handler
-#define qemu_add_mouse_event_handler original_qemu_add_mouse_event_handler
-#endif
-static QTAILQ_HEAD(, QEMUPutKBDEntry) kbd_handlers =
-    QTAILQ_HEAD_INITIALIZER(kbd_handlers);
-static QTAILQ_HEAD(, QEMUPutLEDEntry) led_handlers = QTAILQ_HEAD_INITIALIZER(led_handlers);
-static QTAILQ_HEAD(, QEMUPutMouseEntry) mouse_handlers =
-    QTAILQ_HEAD_INITIALIZER(mouse_handlers);
+struct QemuInputHandlerState {
+    DeviceState       *dev;
+    QemuInputHandler  *handler;
+    int               id;
+    int               events;
+    QemuConsole       *con;
+    QTAILQ_ENTRY(QemuInputHandlerState) node;
+};
+
+typedef struct QemuInputEventQueue QemuInputEventQueue;
+struct QemuInputEventQueue {
+    enum {
+        QEMU_INPUT_QUEUE_DELAY = 1,
+        QEMU_INPUT_QUEUE_EVENT,
+        QEMU_INPUT_QUEUE_SYNC,
+    } type;
+    QEMUTimer *timer;
+    uint32_t delay_ms;
+    QemuConsole *src;
+    InputEvent *evt;
+    QTAILQ_ENTRY(QemuInputEventQueue) node;
+};
+
+static QTAILQ_HEAD(, QemuInputHandlerState) handlers =
+    QTAILQ_HEAD_INITIALIZER(handlers);
 static NotifierList mouse_mode_notifiers =
     NOTIFIER_LIST_INITIALIZER(mouse_mode_notifiers);
 
-void qemu_add_kbd_event_handler(QEMUPutKBDEvent *func, void *opaque)
+static QTAILQ_HEAD(QemuInputEventQueueHead, QemuInputEventQueue) kbd_queue =
+    QTAILQ_HEAD_INITIALIZER(kbd_queue);
+static QEMUTimer *kbd_timer;
+static uint32_t kbd_default_delay_ms = 10;
+static uint32_t queue_count;
+static uint32_t queue_limit = 1024;
+
+QemuInputHandlerState *qemu_input_handler_register(DeviceState *dev,
+                                                   QemuInputHandler *handler)
 {
-    QEMUPutKBDEntry *s;
+    QemuInputHandlerState *s = g_new0(QemuInputHandlerState, 1);
+    static int id = 1;
 
-    if (func != NULL) {
-        s = g_malloc0(sizeof(QEMUPutKBDEntry));
+    s->dev = dev;
+    s->handler = handler;
+    s->id = id++;
+    QTAILQ_INSERT_TAIL(&handlers, s, node);
 
-        s->put_kbd_event = func;
-        s->opaque = opaque;
-
-        QTAILQ_INSERT_TAIL(&kbd_handlers, s, next);
-    }
+    qemu_input_check_mode_change();
+    return s;
 }
 
-void qemu_remove_kbd_event_handler(QEMUPutKBDEvent *func, void *opaque)
+void qemu_input_handler_activate(QemuInputHandlerState *s)
 {
-    QEMUPutKBDEntry *cursor, *cursor_next;
-    if (func != NULL) {
-        QTAILQ_FOREACH_SAFE(cursor, &kbd_handlers, next, cursor_next) {
-            if (cursor->put_kbd_event == func && cursor->opaque == opaque) {
-                QTAILQ_REMOVE(&kbd_handlers, cursor, next);
-            }
+    QTAILQ_REMOVE(&handlers, s, node);
+    QTAILQ_INSERT_HEAD(&handlers, s, node);
+    qemu_input_check_mode_change();
+}
+
+void qemu_input_handler_deactivate(QemuInputHandlerState *s)
+{
+    QTAILQ_REMOVE(&handlers, s, node);
+    QTAILQ_INSERT_TAIL(&handlers, s, node);
+    qemu_input_check_mode_change();
+}
+
+void qemu_input_handler_unregister(QemuInputHandlerState *s)
+{
+    QTAILQ_REMOVE(&handlers, s, node);
+    g_free(s);
+    qemu_input_check_mode_change();
+}
+
+void qemu_input_handler_bind(QemuInputHandlerState *s,
+                             const char *device_id, int head,
+                             Error **errp)
+{
+    QemuConsole *con;
+    Error *err = NULL;
+
+    con = qemu_console_lookup_by_device_name(device_id, head, &err);
+    if (err) {
+        error_propagate(errp, err);
+        return;
+    }
+
+    s->con = con;
+}
+
+static QemuInputHandlerState*
+qemu_input_find_handler(uint32_t mask, QemuConsole *con)
+{
+    QemuInputHandlerState *s;
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (s->con == NULL || s->con != con) {
+            continue;
+        }
+        if (mask & s->handler->mask) {
+            return s;
         }
     }
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (s->con != NULL) {
+            continue;
+        }
+        if (mask & s->handler->mask) {
+            return s;
+        }
+    }
+    return NULL;
 }
 
-static void check_mode_change(void)
+void qmp_input_send_event(bool has_device, const char *device,
+                          bool has_head, int64_t head,
+                          InputEventList *events, Error **errp)
 {
-    static int current_is_absolute, current_has_absolute;
+    InputEventList *e;
+    QemuConsole *con;
+    Error *err = NULL;
+
+    con = NULL;
+    if (has_device) {
+        if (!has_head) {
+            head = 0;
+        }
+        con = qemu_console_lookup_by_device_name(device, head, &err);
+        if (err) {
+            error_propagate(errp, err);
+            return;
+        }
+    }
+
+    if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {
+        error_setg(errp, "VM not running");
+        return;
+    }
+
+    for (e = events; e != NULL; e = e->next) {
+        InputEvent *event = e->value;
+
+        if (!qemu_input_find_handler(1 << event->type, con)) {
+            error_setg(errp, "Input handler not found for "
+                             "event type %s",
+                            InputEventKind_str(event->type));
+            return;
+        }
+    }
+
+    for (e = events; e != NULL; e = e->next) {
+        InputEvent *evt = e->value;
+
+        if (evt->type == INPUT_EVENT_KIND_KEY &&
+            evt->u.key.data->key->type == KEY_VALUE_KIND_NUMBER) {
+            KeyValue *key = evt->u.key.data->key;
+            QKeyCode code = qemu_input_key_number_to_qcode(key->u.number.data);
+            qemu_input_event_send_key_qcode(con, code, evt->u.key.data->down);
+        } else {
+            qemu_input_event_send(con, evt);
+        }
+    }
+
+    qemu_input_event_sync();
+}
+
+static int qemu_input_transform_invert_abs_value(int value)
+{
+  return (int64_t)INPUT_EVENT_ABS_MAX - value + INPUT_EVENT_ABS_MIN;
+}
+
+static void qemu_input_transform_abs_rotate(InputEvent *evt)
+{
+    InputMoveEvent *move = evt->u.abs.data;
+    switch (graphic_rotate) {
+    case 90:
+        if (move->axis == INPUT_AXIS_X) {
+            move->axis = INPUT_AXIS_Y;
+        } else if (move->axis == INPUT_AXIS_Y) {
+            move->axis = INPUT_AXIS_X;
+            move->value = qemu_input_transform_invert_abs_value(move->value);
+        }
+        break;
+    case 180:
+        move->value = qemu_input_transform_invert_abs_value(move->value);
+        break;
+    case 270:
+        if (move->axis == INPUT_AXIS_X) {
+            move->axis = INPUT_AXIS_Y;
+            move->value = qemu_input_transform_invert_abs_value(move->value);
+        } else if (move->axis == INPUT_AXIS_Y) {
+            move->axis = INPUT_AXIS_X;
+        }
+        break;
+    }
+}
+
+static void qemu_input_event_trace(QemuConsole *src, InputEvent *evt)
+{
+    const char *name;
+    int qcode, idx = -1;
+    InputKeyEvent *key;
+    InputBtnEvent *btn;
+    InputMoveEvent *move;
+
+    if (src) {
+        idx = qemu_console_get_index(src);
+    }
+    switch (evt->type) {
+    case INPUT_EVENT_KIND_KEY:
+        key = evt->u.key.data;
+        switch (key->key->type) {
+        case KEY_VALUE_KIND_NUMBER:
+            qcode = qemu_input_key_number_to_qcode(key->key->u.number.data);
+            name = QKeyCode_str(qcode);
+            trace_input_event_key_number(idx, key->key->u.number.data,
+                                         name, key->down);
+            break;
+        case KEY_VALUE_KIND_QCODE:
+            // The android emulator already has a keycode translator in place
+            // and is using raw linux codes that are sent to the emulator.
+            // Hence we just log the raw code data without translating to and
+            // from qcodes.
+            trace_input_event_key_number(idx, key->key->u.qcode.data, "",
+                                         key->down);
+            break;
+        case KEY_VALUE_KIND__MAX:
+            /* keep gcc happy */
+            break;
+        }
+        break;
+    case INPUT_EVENT_KIND_BTN:
+        btn = evt->u.btn.data;
+        name = InputButton_str(btn->button);
+        trace_input_event_btn(idx, name, btn->down);
+        break;
+    case INPUT_EVENT_KIND_REL:
+        move = evt->u.rel.data;
+        name = InputAxis_str(move->axis);
+        trace_input_event_rel(idx, name, move->value);
+        break;
+    case INPUT_EVENT_KIND_ABS:
+        move = evt->u.abs.data;
+        name = InputAxis_str(move->axis);
+        trace_input_event_abs(idx, name, move->value);
+        break;
+    case INPUT_EVENT_KIND__MAX:
+        /* keep gcc happy */
+        break;
+    }
+}
+
+static void qemu_input_queue_process(void *opaque)
+{
+    struct QemuInputEventQueueHead *queue = opaque;
+    QemuInputEventQueue *item;
+
+    g_assert(!QTAILQ_EMPTY(queue));
+    item = QTAILQ_FIRST(queue);
+    g_assert(item->type == QEMU_INPUT_QUEUE_DELAY);
+    QTAILQ_REMOVE(queue, item, node);
+    queue_count--;
+    g_free(item);
+
+    while (!QTAILQ_EMPTY(queue)) {
+        item = QTAILQ_FIRST(queue);
+        switch (item->type) {
+        case QEMU_INPUT_QUEUE_DELAY:
+            timer_mod(item->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                      + item->delay_ms);
+            return;
+        case QEMU_INPUT_QUEUE_EVENT:
+            qemu_input_event_send(item->src, item->evt);
+            qapi_free_InputEvent(item->evt);
+            break;
+        case QEMU_INPUT_QUEUE_SYNC:
+            qemu_input_event_sync();
+            break;
+        }
+        QTAILQ_REMOVE(queue, item, node);
+        queue_count--;
+        g_free(item);
+    }
+}
+
+static void qemu_input_queue_delay(struct QemuInputEventQueueHead *queue,
+                                   QEMUTimer *timer, uint32_t delay_ms)
+{
+    QemuInputEventQueue *item = g_new0(QemuInputEventQueue, 1);
+    bool start_timer = QTAILQ_EMPTY(queue);
+
+    item->type = QEMU_INPUT_QUEUE_DELAY;
+    item->delay_ms = delay_ms;
+    item->timer = timer;
+    QTAILQ_INSERT_TAIL(queue, item, node);
+    queue_count++;
+
+    if (start_timer) {
+        timer_mod(item->timer, qemu_clock_get_ms(QEMU_CLOCK_VIRTUAL)
+                  + item->delay_ms);
+    }
+}
+
+static void qemu_input_queue_event(struct QemuInputEventQueueHead *queue,
+                                   QemuConsole *src, InputEvent *evt)
+{
+    QemuInputEventQueue *item = g_new0(QemuInputEventQueue, 1);
+
+    item->type = QEMU_INPUT_QUEUE_EVENT;
+    item->src = src;
+    item->evt = evt;
+    QTAILQ_INSERT_TAIL(queue, item, node);
+    queue_count++;
+}
+
+static void qemu_input_queue_sync(struct QemuInputEventQueueHead *queue)
+{
+    QemuInputEventQueue *item = g_new0(QemuInputEventQueue, 1);
+
+    item->type = QEMU_INPUT_QUEUE_SYNC;
+    QTAILQ_INSERT_TAIL(queue, item, node);
+    queue_count++;
+}
+
+void qemu_input_event_send_impl(QemuConsole *src, InputEvent *evt)
+{
+    QemuInputHandlerState *s;
+
+    qemu_input_event_trace(src, evt);
+
+    /* pre processing */
+    if (graphic_rotate && (evt->type == INPUT_EVENT_KIND_ABS)) {
+            qemu_input_transform_abs_rotate(evt);
+    }
+
+    /* send event */
+    s = qemu_input_find_handler(1 << evt->type, src);
+    if (!s) {
+        return;
+    }
+    s->handler->event(s->dev, src, evt);
+    s->events++;
+}
+
+void qemu_input_event_send(QemuConsole *src, InputEvent *evt)
+{
+    /* Expect all parts of QEMU to send events with QCodes exclusively.
+     * Key numbers are only supported as end-user input via QMP */
+    assert(!(evt->type == INPUT_EVENT_KIND_KEY &&
+             evt->u.key.data->key->type == KEY_VALUE_KIND_NUMBER));
+
+
+    /*
+     * 'sysrq' was mistakenly added to hack around the fact that
+     * the ps2 driver was not generating correct scancodes sequences
+     * when 'alt+print' was pressed. This flaw is now fixed and the
+     * 'sysrq' key serves no further purpose. We normalize it to
+     * 'print', so that downstream receivers of the event don't
+     * neeed to deal with this mistake
+     */
+    if (evt->type == INPUT_EVENT_KIND_KEY &&
+        evt->u.key.data->key->u.qcode.data == Q_KEY_CODE_SYSRQ) {
+        evt->u.key.data->key->u.qcode.data = Q_KEY_CODE_PRINT;
+    }
+
+    if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {
+        return;
+    }
+
+    replay_input_event(src, evt);
+}
+
+void qemu_input_event_sync_impl(void)
+{
+    QemuInputHandlerState *s;
+
+    trace_input_event_sync();
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (!s->events) {
+            continue;
+        }
+        if (s->handler->sync) {
+            s->handler->sync(s->dev);
+        }
+        s->events = 0;
+    }
+}
+
+void qemu_input_event_sync(void)
+{
+    if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {
+        return;
+    }
+
+    replay_input_sync_event();
+}
+
+static InputEvent *qemu_input_event_new_key(KeyValue *key, bool down)
+{
+    InputEvent *evt = g_new0(InputEvent, 1);
+    evt->u.key.data = g_new0(InputKeyEvent, 1);
+    evt->type = INPUT_EVENT_KIND_KEY;
+    evt->u.key.data->key = key;
+    evt->u.key.data->down = down;
+    return evt;
+}
+
+
+void qemu_input_event_enqueue(QemuConsole *src, InputEvent *evt) {
+    if (QTAILQ_EMPTY(&kbd_queue)) {
+        qemu_input_event_send(src, evt);
+        qemu_input_event_sync();
+        qapi_free_InputEvent(evt);
+    } else if (queue_count < queue_limit) {
+        qemu_input_queue_event(&kbd_queue, src, evt);
+        qemu_input_queue_sync(&kbd_queue);
+    } else {
+        qapi_free_InputEvent(evt);
+    }
+}
+
+void qemu_input_event_send_key(QemuConsole *src, KeyValue *key, bool down)
+{
+    InputEvent *evt;
+    evt = qemu_input_event_new_key(key, down);
+    qemu_input_event_enqueue(src, evt);
+}
+
+void qemu_input_event_send_key_number(QemuConsole *src, int num, bool down)
+{
+    QKeyCode code = qemu_input_key_number_to_qcode(num);
+    qemu_input_event_send_key_qcode(src, code, down);
+}
+
+void qemu_input_event_send_key_qcode(QemuConsole *src, QKeyCode q, bool down)
+{
+    KeyValue *key = g_new0(KeyValue, 1);
+    key->type = KEY_VALUE_KIND_QCODE;
+    key->u.qcode.data = q;
+    qemu_input_event_send_key(src, key, down);
+}
+
+void qemu_input_event_send_key_delay(uint32_t delay_ms)
+{
+    if (!runstate_is_running() && !runstate_check(RUN_STATE_SUSPENDED)) {
+        return;
+    }
+
+    if (!kbd_timer) {
+        kbd_timer = timer_new_ms(QEMU_CLOCK_VIRTUAL, qemu_input_queue_process,
+                                 &kbd_queue);
+    }
+    if (queue_count < queue_limit) {
+        qemu_input_queue_delay(&kbd_queue, kbd_timer,
+                               delay_ms ? delay_ms : kbd_default_delay_ms);
+    }
+}
+
+InputEvent *qemu_input_event_new_btn(InputButton btn, bool down)
+{
+    InputEvent *evt = g_new0(InputEvent, 1);
+    evt->u.btn.data = g_new0(InputBtnEvent, 1);
+    evt->type = INPUT_EVENT_KIND_BTN;
+    evt->u.btn.data->button = btn;
+    evt->u.btn.data->down = down;
+    return evt;
+}
+
+void qemu_input_queue_btn(QemuConsole *src, InputButton btn, bool down)
+{
+    InputEvent *evt;
+    evt = qemu_input_event_new_btn(btn, down);
+    qemu_input_event_send(src, evt);
+    qapi_free_InputEvent(evt);
+}
+
+void qemu_input_update_buttons(QemuConsole *src, uint32_t *button_map,
+                               uint32_t button_old, uint32_t button_new)
+{
+    InputButton btn;
+    uint32_t mask;
+
+    for (btn = 0; btn < INPUT_BUTTON__MAX; btn++) {
+        mask = button_map[btn];
+        if ((button_old & mask) == (button_new & mask)) {
+            continue;
+        }
+        qemu_input_queue_btn(src, btn, button_new & mask);
+    }
+}
+
+bool qemu_input_is_absolute(void)
+{
+    QemuInputHandlerState *s;
+
+    s = qemu_input_find_handler(INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_ABS,
+                                NULL);
+    return (s != NULL) && (s->handler->mask & INPUT_EVENT_MASK_ABS);
+}
+
+int qemu_input_scale_axis(int value,
+                          int min_in, int max_in,
+                          int min_out, int max_out)
+{
+    int64_t range_in = (int64_t)max_in - min_in;
+    int64_t range_out = (int64_t)max_out - min_out;
+
+    if (range_in < 1) {
+        return min_out + range_out / 2;
+    }
+    return ((int64_t)value - min_in) * range_out / range_in + min_out;
+}
+
+InputEvent *qemu_input_event_new_move(InputEventKind kind,
+                                      InputAxis axis, int value)
+{
+    InputEvent *evt = g_new0(InputEvent, 1);
+    InputMoveEvent *move = g_new0(InputMoveEvent, 1);
+
+    evt->type = kind;
+    evt->u.rel.data = move; /* evt->u.rel is the same as evt->u.abs */
+    move->axis = axis;
+    move->value = value;
+    return evt;
+}
+
+void qemu_input_queue_rel(QemuConsole *src, InputAxis axis, int value)
+{
+    InputEvent *evt;
+    evt = qemu_input_event_new_move(INPUT_EVENT_KIND_REL, axis, value);
+    qemu_input_event_send(src, evt);
+    qapi_free_InputEvent(evt);
+}
+
+void qemu_input_queue_abs(QemuConsole *src, InputAxis axis, int value,
+                          int min_in, int max_in)
+{
+    InputEvent *evt;
+    int scaled = qemu_input_scale_axis(value, min_in, max_in,
+                                       INPUT_EVENT_ABS_MIN,
+                                       INPUT_EVENT_ABS_MAX);
+    evt = qemu_input_event_new_move(INPUT_EVENT_KIND_ABS, axis, scaled);
+    qemu_input_event_send(src, evt);
+    qapi_free_InputEvent(evt);
+}
+
+void qemu_input_check_mode_change(void)
+{
+    static int current_is_absolute;
     int is_absolute;
-    int has_absolute;
 
-    is_absolute = kbd_mouse_is_absolute();
-    has_absolute = kbd_mouse_has_absolute();
+    is_absolute = qemu_input_is_absolute();
 
-    if (is_absolute != current_is_absolute ||
-        has_absolute != current_has_absolute) {
+    if (is_absolute != current_is_absolute) {
+        trace_input_mouse_mode(is_absolute);
         notifier_list_notify(&mouse_mode_notifiers, NULL);
     }
 
     current_is_absolute = is_absolute;
-    current_has_absolute = has_absolute;
-}
-
-QEMUPutMouseEntry *qemu_add_mouse_event_handler(QEMUPutMouseEvent *func,
-                                                void *opaque, int absolute,
-                                                const char *name)
-{
-    QEMUPutMouseEntry *s;
-    static int mouse_index = 0;
-
-    s = g_malloc0(sizeof(QEMUPutMouseEntry));
-
-    s->qemu_put_mouse_event = func;
-    s->qemu_put_mouse_event_opaque = opaque;
-    s->qemu_put_mouse_event_absolute = absolute;
-    s->qemu_put_mouse_event_name = g_strdup(name);
-    s->index = mouse_index++;
-
-    QTAILQ_INSERT_TAIL(&mouse_handlers, s, node);
-
-    check_mode_change();
-
-    return s;
-}
-
-void qemu_activate_mouse_event_handler(QEMUPutMouseEntry *entry)
-{
-    QTAILQ_REMOVE(&mouse_handlers, entry, node);
-    QTAILQ_INSERT_HEAD(&mouse_handlers, entry, node);
-
-    check_mode_change();
-}
-
-void qemu_remove_mouse_event_handler(QEMUPutMouseEntry *entry)
-{
-    QTAILQ_REMOVE(&mouse_handlers, entry, node);
-
-    g_free(entry->qemu_put_mouse_event_name);
-    g_free(entry);
-
-    check_mode_change();
-}
-
-QEMUPutLEDEntry *qemu_add_led_event_handler(QEMUPutLEDEvent *func,
-                                            void *opaque)
-{
-    QEMUPutLEDEntry *s;
-
-    s = g_malloc0(sizeof(QEMUPutLEDEntry));
-
-    s->put_led = func;
-    s->opaque = opaque;
-    QTAILQ_INSERT_TAIL(&led_handlers, s, next);
-    return s;
-}
-
-void qemu_remove_led_event_handler(QEMUPutLEDEntry *entry)
-{
-    if (entry == NULL)
-        return;
-    QTAILQ_REMOVE(&led_handlers, entry, next);
-    g_free(entry);
-}
-
-void kbd_put_keycode(int keycode)
-{
-    QEMUPutKBDEntry *cursor;
-    QTAILQ_FOREACH(cursor, &kbd_handlers, next) {
-        cursor->put_kbd_event(cursor->opaque, keycode);
-    }
-}
-
-void kbd_put_ledstate(int ledstate)
-{
-    QEMUPutLEDEntry *cursor;
-
-    QTAILQ_FOREACH(cursor, &led_handlers, next) {
-        cursor->put_led(cursor->opaque, ledstate);
-    }
-}
-
-void kbd_mouse_event(int dx, int dy, int dz, int buttons_state)
-{
-    QEMUPutMouseEntry *entry;
-    QEMUPutMouseEvent *mouse_event;
-    void *mouse_event_opaque;
-#ifndef CONFIG_SKINNING
-    int width;
-#endif
-
-    if (QTAILQ_EMPTY(&mouse_handlers)) {
-        return;
-    }
-
-    entry = QTAILQ_FIRST(&mouse_handlers);
-
-    mouse_event = entry->qemu_put_mouse_event;
-    mouse_event_opaque = entry->qemu_put_mouse_event_opaque;
-
-    if (mouse_event) {
-#ifndef CONFIG_SKINNING
-        if (graphic_rotate) {
-            if (entry->qemu_put_mouse_event_absolute) {
-                width = 0x7fff;
-            } else {
-                width = graphic_width - 1;
-            }
-            mouse_event(mouse_event_opaque, width - dy, dx, dz, buttons_state);
-        } else {
-            mouse_event(mouse_event_opaque, dx, dy, dz, buttons_state);
-        }
-#else
-        mouse_event(mouse_event_opaque, dx, dy, dz, buttons_state);
-#endif
-    }
-}
-
-int kbd_mouse_is_absolute(void)
-{
-    if (QTAILQ_EMPTY(&mouse_handlers)) {
-        return 0;
-    }
-
-    return QTAILQ_FIRST(&mouse_handlers)->qemu_put_mouse_event_absolute;
-}
-
-int kbd_mouse_has_absolute(void)
-{
-    QEMUPutMouseEntry *entry;
-
-    QTAILQ_FOREACH(entry, &mouse_handlers, node) {
-        if (entry->qemu_put_mouse_event_absolute) {
-            return 1;
-        }
-    }
-
-    return 0;
-}
-
-static void info_mice_iter(QObject *data, void *opaque)
-{
-    QDict *mouse;
-    Monitor *mon = opaque;
-
-    mouse = qobject_to_qdict(data);
-    monitor_printf(mon, "%c Mouse #%" PRId64 ": %s%s\n",
-                  (qdict_get_bool(mouse, "current") ? '*' : ' '),
-                   qdict_get_int(mouse, "index"), qdict_get_str(mouse, "name"),
-                   qdict_get_bool(mouse, "absolute") ? " (absolute)" : "");
-}
-
-void do_info_mice_print(Monitor *mon, const QObject *data)
-{
-    QList *mice_list;
-
-    mice_list = qobject_to_qlist(data);
-    if (qlist_empty(mice_list)) {
-        monitor_printf(mon, "No mouse devices connected\n");
-        return;
-    }
-
-    qlist_iter(mice_list, info_mice_iter, mon);
-}
-
-void do_info_mice(Monitor *mon, QObject **ret_data)
-{
-    QEMUPutMouseEntry *cursor;
-    QList *mice_list;
-    int current;
-
-    mice_list = qlist_new();
-
-    if (QTAILQ_EMPTY(&mouse_handlers)) {
-        goto out;
-    }
-
-    current = QTAILQ_FIRST(&mouse_handlers)->index;
-
-    QTAILQ_FOREACH(cursor, &mouse_handlers, node) {
-        QObject *obj;
-        obj = qobject_from_jsonf("{ 'name': %s,"
-                                 "  'index': %d,"
-                                 "  'current': %i,"
-                                 "  'absolute': %i }",
-                                 cursor->qemu_put_mouse_event_name,
-                                 cursor->index,
-                                 cursor->index == current,
-                                 !!cursor->qemu_put_mouse_event_absolute);
-        qlist_append_obj(mice_list, obj);
-    }
-
-out:
-    *ret_data = QOBJECT(mice_list);
-}
-
-void do_mouse_set(Monitor *mon, const QDict *qdict)
-{
-    QEMUPutMouseEntry *cursor;
-    int index = qdict_get_int(qdict, "index");
-    int found = 0;
-
-    if (QTAILQ_EMPTY(&mouse_handlers)) {
-        monitor_printf(mon, "No mouse devices connected\n");
-        return;
-    }
-
-    QTAILQ_FOREACH(cursor, &mouse_handlers, node) {
-        if (cursor->index == index) {
-            found = 1;
-            qemu_activate_mouse_event_handler(cursor);
-            break;
-        }
-    }
-
-    if (!found) {
-        monitor_printf(mon, "Mouse at given index not found\n");
-    }
-
-    check_mode_change();
 }
 
 void qemu_add_mouse_mode_change_notifier(Notifier *notify)
@@ -313,4 +577,59 @@ void qemu_add_mouse_mode_change_notifier(Notifier *notify)
 void qemu_remove_mouse_mode_change_notifier(Notifier *notify)
 {
     notifier_remove(notify);
+}
+
+MouseInfoList *qmp_query_mice(Error **errp)
+{
+    MouseInfoList *mice_list = NULL;
+    MouseInfoList *info;
+    QemuInputHandlerState *s;
+    bool current = true;
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (!(s->handler->mask &
+              (INPUT_EVENT_MASK_REL | INPUT_EVENT_MASK_ABS))) {
+            continue;
+        }
+
+        info = g_new0(MouseInfoList, 1);
+        info->value = g_new0(MouseInfo, 1);
+        info->value->index = s->id;
+        info->value->name = g_strdup(s->handler->name);
+        info->value->absolute = s->handler->mask & INPUT_EVENT_MASK_ABS;
+        info->value->current = current;
+
+        current = false;
+        info->next = mice_list;
+        mice_list = info;
+    }
+
+    return mice_list;
+}
+
+void hmp_mouse_set(Monitor *mon, const QDict *qdict)
+{
+    QemuInputHandlerState *s;
+    int index = qdict_get_int(qdict, "index");
+    int found = 0;
+
+    QTAILQ_FOREACH(s, &handlers, node) {
+        if (s->id != index) {
+            continue;
+        }
+        if (!(s->handler->mask & (INPUT_EVENT_MASK_REL |
+                                  INPUT_EVENT_MASK_ABS))) {
+            error_report("Input device '%s' is not a mouse", s->handler->name);
+            return;
+        }
+        found = 1;
+        qemu_input_handler_activate(s);
+        break;
+    }
+
+    if (!found) {
+        error_report("Mouse at index '%d' not found", index);
+    }
+
+    qemu_input_check_mode_change();
 }

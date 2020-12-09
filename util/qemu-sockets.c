@@ -11,56 +11,38 @@
  *  but WITHOUT ANY WARRANTY; without even the implied warranty of
  *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  *  GNU General Public License for more details.
+ *
+ * Contributions after 2012-01-13 are licensed under the terms of the
+ * GNU GPL, version 2 or (at your option) any later version.
  */
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <ctype.h>
-#include <errno.h>
-#include <unistd.h>
+#include "qemu/osdep.h"
 
+#ifdef CONFIG_AF_VSOCK
+#include <linux/vm_sockets.h>
+#endif /* CONFIG_AF_VSOCK */
+
+#include "monitor/monitor.h"
+#include "qapi/clone-visitor.h"
+#include "qapi/error.h"
+#include "qapi/qapi-visit-sockets.h"
 #include "qemu/sockets.h"
-#include "qemu-common.h" /* for qemu_isdigit */
+#include "qemu/main-loop.h"
+#include "qapi/qobject-input-visitor.h"
+#include "qapi/qobject-output-visitor.h"
+#include "qemu/cutils.h"
 
 #ifndef AI_ADDRCONFIG
 # define AI_ADDRCONFIG 0
 #endif
 
-static int sockets_debug = 0;
-static const int on=1, off=0;
-
-/* used temporarely until all users are converted to QemuOpts */
-static QemuOptsList dummy_opts = {
-    .name = "dummy",
-    .head = QTAILQ_HEAD_INITIALIZER(dummy_opts.head),
-    .desc = {
-        {
-            .name = "path",
-            .type = QEMU_OPT_STRING,
-        },{
-            .name = "host",
-            .type = QEMU_OPT_STRING,
-        },{
-            .name = "port",
-            .type = QEMU_OPT_STRING,
-        },{
-            .name = "to",
-            .type = QEMU_OPT_NUMBER,
-        },{
-            .name = "ipv4",
-            .type = QEMU_OPT_BOOL,
-        },{
-            .name = "ipv6",
-            .type = QEMU_OPT_BOOL,
-#ifdef CONFIG_ANDROID
-        },{
-            .name = "socket",
-            .type = QEMU_OPT_NUMBER,
+#ifndef AI_V4MAPPED
+# define AI_V4MAPPED 0
 #endif
-        },
-        { /* end if list */ }
-    },
-};
+
+#ifndef AI_NUMERICSERV
+# define AI_NUMERICSERV 0
+#endif
+
 
 static int inet_getport(struct addrinfo *e)
 {
@@ -96,254 +78,423 @@ static void inet_setport(struct addrinfo *e, int port)
     }
 }
 
-const char *inet_strfamily(int family)
+NetworkAddressFamily inet_netfamily(int family)
 {
     switch (family) {
-    case PF_INET6: return "ipv6";
-    case PF_INET:  return "ipv4";
-    case PF_UNIX:  return "unix";
+    case PF_INET6: return NETWORK_ADDRESS_FAMILY_IPV6;
+    case PF_INET:  return NETWORK_ADDRESS_FAMILY_IPV4;
+    case PF_UNIX:  return NETWORK_ADDRESS_FAMILY_UNIX;
+#ifdef CONFIG_AF_VSOCK
+    case PF_VSOCK: return NETWORK_ADDRESS_FAMILY_VSOCK;
+#endif /* CONFIG_AF_VSOCK */
     }
-    return "unknown";
+    return NETWORK_ADDRESS_FAMILY_UNKNOWN;
 }
 
-static void inet_print_addrinfo(const char *tag, struct addrinfo *res)
+bool fd_is_socket(int fd)
 {
-    struct addrinfo *e;
-    char uaddr[INET6_ADDRSTRLEN+1];
-    char uport[33];
-
-    for (e = res; e != NULL; e = e->ai_next) {
-        getnameinfo((struct sockaddr*)e->ai_addr,e->ai_addrlen,
-                    uaddr,INET6_ADDRSTRLEN,uport,32,
-                    NI_NUMERICHOST | NI_NUMERICSERV);
-        fprintf(stderr,"%s: getaddrinfo: family %s, host %s, port %s\n",
-                tag, inet_strfamily(e->ai_family), uaddr, uport);
-    }
+    int optval;
+    socklen_t optlen = sizeof(optval);
+    return !qemu_getsockopt(fd, SOL_SOCKET, SO_TYPE, &optval, &optlen);
 }
 
-int inet_listen_opts(QemuOpts *opts, int port_offset)
+
+/*
+ * Matrix we're trying to apply
+ *
+ *  ipv4  ipv6   family
+ *   -     -       PF_UNSPEC
+ *   -     f       PF_INET
+ *   -     t       PF_INET6
+ *   f     -       PF_INET6
+ *   f     f       <error>
+ *   f     t       PF_INET6
+ *   t     -       PF_INET
+ *   t     f       PF_INET
+ *   t     t       PF_INET6/PF_UNSPEC
+ *
+ * NB, this matrix is only about getting the necessary results
+ * from getaddrinfo(). Some of the cases require further work
+ * after reading results from getaddrinfo in order to fully
+ * apply the logic the end user wants.
+ *
+ * In the first and last cases, we must set IPV6_V6ONLY=0
+ * when binding, to allow a single listener to potentially
+ * accept both IPv4+6 addresses.
+ */
+int inet_ai_family_from_address(InetSocketAddress *addr,
+                                Error **errp)
+{
+    if (addr->has_ipv6 && addr->has_ipv4 &&
+        !addr->ipv6 && !addr->ipv4) {
+        error_setg(errp, "Cannot disable IPv4 and IPv6 at same time");
+        return PF_UNSPEC;
+    }
+    if ((addr->has_ipv6 && addr->ipv6) && (addr->has_ipv4 && addr->ipv4)) {
+        /*
+         * Some backends can only do a single listener. In that case
+         * we want empty hostname to resolve to "::" and then use the
+         * flag IPV6_V6ONLY==0 to get both protocols on 1 socket. This
+         * doesn't work for addresses other than "", so they're just
+         * inevitably broken until multiple listeners can be used,
+         * and thus we honour getaddrinfo automatic protocol detection
+         * Once all backends do multi-listener, remove the PF_INET6
+         * branch entirely.
+         */
+        if (!addr->host || g_str_equal(addr->host, "")) {
+            return PF_INET6;
+        } else {
+            return PF_UNSPEC;
+        }
+    }
+    if ((addr->has_ipv6 && addr->ipv6) || (addr->has_ipv4 && !addr->ipv4)) {
+        return PF_INET6;
+    }
+    if ((addr->has_ipv4 && addr->ipv4) || (addr->has_ipv6 && !addr->ipv6)) {
+        return PF_INET;
+    }
+    return PF_UNSPEC;
+}
+
+static int create_fast_reuse_socket(struct addrinfo *e)
+{
+    int slisten = qemu_socket(e->ai_family, e->ai_socktype, e->ai_protocol);
+    if (slisten < 0) {
+        return -1;
+    }
+    socket_set_fast_reuse(slisten);
+    return slisten;
+}
+
+static int try_bind(int socket, InetSocketAddress *saddr, struct addrinfo *e)
+{
+#ifndef IPV6_V6ONLY
+    return bind(socket, e->ai_addr, e->ai_addrlen);
+#else
+    /*
+     * Deals with first & last cases in matrix in comment
+     * for inet_ai_family_from_address().
+     */
+    int v6only =
+        ((!saddr->has_ipv4 && !saddr->has_ipv6) ||
+         (saddr->has_ipv4 && saddr->ipv4 &&
+          saddr->has_ipv6 && saddr->ipv6)) ? 0 : 1;
+    int stat;
+
+ rebind:
+    if (e->ai_family == PF_INET6) {
+        qemu_setsockopt(socket, IPPROTO_IPV6, IPV6_V6ONLY, &v6only,
+                        sizeof(v6only));
+    }
+
+    stat = bind(socket, e->ai_addr, e->ai_addrlen);
+    if (!stat) {
+        return 0;
+    }
+
+    /* If we got EADDRINUSE from an IPv6 bind & v6only is unset,
+     * it could be that the IPv4 port is already claimed, so retry
+     * with v6only set
+     */
+    if (e->ai_family == PF_INET6 && errno == EADDRINUSE && !v6only) {
+        v6only = 1;
+        goto rebind;
+    }
+    return stat;
+#endif
+}
+
+static int inet_listen_saddr(InetSocketAddress *saddr,
+                             int port_offset,
+                             Error **errp)
 {
     struct addrinfo ai,*res,*e;
-    const char *addr;
     char port[33];
     char uaddr[INET6_ADDRSTRLEN+1];
     char uport[33];
-    int slisten,rc,to,try_next;
+    int rc, port_min, port_max, p;
+    int slisten = -1;
+    int saved_errno = 0;
+    bool socket_created = false;
+    Error *err = NULL;
 
     memset(&ai,0, sizeof(ai));
-    ai.ai_flags = AI_PASSIVE | AI_ADDRCONFIG;
-    ai.ai_family = PF_UNSPEC;
+    ai.ai_flags = AI_PASSIVE;
+    if (saddr->has_numeric && saddr->numeric) {
+        ai.ai_flags |= AI_NUMERICHOST | AI_NUMERICSERV;
+    }
+    ai.ai_family = inet_ai_family_from_address(saddr, &err);
     ai.ai_socktype = SOCK_STREAM;
 
-#ifdef CONFIG_ANDROID
-    const char* socket_fd = qemu_opt_get(opts, "socket");
-    if (socket_fd) {
-        return atoi(socket_fd);
-    }
-#endif
-
-    if ((qemu_opt_get(opts, "host") == NULL) ||
-        (qemu_opt_get(opts, "port") == NULL)) {
-        fprintf(stderr, "%s: host and/or port not specified\n", __FUNCTION__);
+    if (err) {
+        error_propagate(errp, err);
         return -1;
     }
-    pstrcpy(port, sizeof(port), qemu_opt_get(opts, "port"));
-    addr = qemu_opt_get(opts, "host");
 
-    to = qemu_opt_get_number(opts, "to", 0);
-    if (qemu_opt_get_bool(opts, "ipv4", 0))
-        ai.ai_family = PF_INET;
-    if (qemu_opt_get_bool(opts, "ipv6", 0))
-        ai.ai_family = PF_INET6;
+    if (saddr->host == NULL) {
+        error_setg(errp, "host not specified");
+        return -1;
+    }
+    if (saddr->port != NULL) {
+        pstrcpy(port, sizeof(port), saddr->port);
+    } else {
+        port[0] = '\0';
+    }
 
     /* lookup */
-    if (port_offset)
-        snprintf(port, sizeof(port), "%d", atoi(port) + port_offset);
-    rc = getaddrinfo(strlen(addr) ? addr : NULL, port, &ai, &res);
+    if (port_offset) {
+        unsigned long long baseport;
+        if (strlen(port) == 0) {
+            error_setg(errp, "port not specified");
+            return -1;
+        }
+        if (parse_uint_full(port, &baseport, 10) < 0) {
+            error_setg(errp, "can't convert to a number: %s", port);
+            return -1;
+        }
+        if (baseport > 65535 ||
+            baseport + port_offset > 65535) {
+            error_setg(errp, "port %s out of range", port);
+            return -1;
+        }
+        snprintf(port, sizeof(port), "%d", (int)baseport + port_offset);
+    }
+    rc = getaddrinfo(strlen(saddr->host) ? saddr->host : NULL,
+                     strlen(port) ? port : NULL, &ai, &res);
     if (rc != 0) {
-        fprintf(stderr,"getaddrinfo(%s,%s): %s\n", addr, port,
-                gai_strerror(rc));
+        error_setg(errp, "address resolution failed for %s:%s: %s",
+                   saddr->host, port, gai_strerror(rc));
         return -1;
     }
-    if (sockets_debug)
-        inet_print_addrinfo(__FUNCTION__, res);
 
-    /* create socket + bind */
+    /* create socket + bind/listen */
     for (e = res; e != NULL; e = e->ai_next) {
         getnameinfo((struct sockaddr*)e->ai_addr,e->ai_addrlen,
 		        uaddr,INET6_ADDRSTRLEN,uport,32,
 		        NI_NUMERICHOST | NI_NUMERICSERV);
-        slisten = qemu_socket(e->ai_family, e->ai_socktype, e->ai_protocol);
-        if (slisten < 0) {
-            fprintf(stderr,"%s: socket(%s): %s\n", __FUNCTION__,
-                    inet_strfamily(e->ai_family), strerror(errno));
-            continue;
-        }
 
-        qemu_setsockopt(slisten,SOL_SOCKET,SO_REUSEADDR,(void*)&on,sizeof(on));
-#ifdef IPV6_V6ONLY
-        if (e->ai_family == PF_INET6) {
-            /* listen on both ipv4 and ipv6 */
-            qemu_setsockopt(slisten,IPPROTO_IPV6,IPV6_V6ONLY,(void*)&off,
-                sizeof(off));
-        }
-#endif
+        port_min = inet_getport(e);
+        port_max = saddr->has_to ? saddr->to + port_offset : port_min;
+        for (p = port_min; p <= port_max; p++) {
+            inet_setport(e, p);
 
-        for (;;) {
-            if (bind(slisten, e->ai_addr, e->ai_addrlen) == 0) {
-                if (sockets_debug)
-                    fprintf(stderr,"%s: bind(%s,%s,%d): OK\n", __FUNCTION__,
-                        inet_strfamily(e->ai_family), uaddr, inet_getport(e));
-                goto listen;
+            slisten = create_fast_reuse_socket(e);
+            if (slisten < 0) {
+                /* First time we expect we might fail to create the socket
+                 * eg if 'e' has AF_INET6 but ipv6 kmod is not loaded.
+                 * Later iterations should always succeed if first iteration
+                 * worked though, so treat that as fatal.
+                 */
+                if (p == port_min) {
+                    continue;
+                } else {
+                    error_setg_errno(errp, errno,
+                                     "Failed to recreate failed listening socket");
+                    goto listen_failed;
+                }
             }
-            try_next = to && (inet_getport(e) <= to + port_offset);
-            if (!try_next || sockets_debug)
-                fprintf(stderr,"%s: bind(%s,%s,%d): %s\n", __FUNCTION__,
-                        inet_strfamily(e->ai_family), uaddr, inet_getport(e),
-                        strerror(errno));
-            if (try_next) {
-                inet_setport(e, inet_getport(e) + 1);
-                continue;
+            socket_created = true;
+
+            rc = try_bind(slisten, saddr, e);
+            if (rc < 0) {
+                if (errno != EADDRINUSE) {
+                    error_setg_errno(errp, errno, "Failed to bind socket");
+                    goto listen_failed;
+                }
+            } else {
+                if (!listen(slisten, 1)) {
+                    goto listen_ok;
+                }
+                if (errno != EADDRINUSE) {
+                    error_setg_errno(errp, errno, "Failed to listen on socket");
+                    goto listen_failed;
+                }
             }
-            break;
+            /* Someone else managed to bind to the same port and beat us
+             * to listen on it! Socket semantics does not allow us to
+             * recover from this situation, so we need to recreate the
+             * socket to allow bind attempts for subsequent ports:
+             */
+            closesocket(slisten);
+            slisten = -1;
         }
+    }
+    error_setg_errno(errp, errno,
+                     socket_created ?
+                     "Failed to find an available port" :
+                     "Failed to create a socket");
+listen_failed:
+    saved_errno = errno;
+    if (slisten >= 0) {
         closesocket(slisten);
     }
-    fprintf(stderr, "%s: FAILED\n", __FUNCTION__);
     freeaddrinfo(res);
+    errno = saved_errno;
     return -1;
 
-listen:
-    if (listen(slisten,1) != 0) {
-        perror("listen");
-        closesocket(slisten);
-        freeaddrinfo(res);
-        return -1;
-    }
-    snprintf(uport, sizeof(uport), "%d", inet_getport(e) - port_offset);
-    qemu_opt_set(opts, "host", uaddr);
-    qemu_opt_set(opts, "port", uport);
-    qemu_opt_set(opts, "ipv6", (e->ai_family == PF_INET6) ? "on" : "off");
-    qemu_opt_set(opts, "ipv4", (e->ai_family != PF_INET6) ? "on" : "off");
+listen_ok:
     freeaddrinfo(res);
     return slisten;
 }
 
-int inet_connect_opts(QemuOpts *opts)
-{
-    struct addrinfo ai,*res,*e;
-    const char *addr;
-    const char *port;
-    char uaddr[INET6_ADDRSTRLEN+1];
-    char uport[33];
-    int sock,rc;
-
-#ifdef CONFIG_ANDROID
-    const char* socket_fd = qemu_opt_get(opts, "socket");
-    if (socket_fd) {
-        return atoi(socket_fd);
-    }
+#ifdef _WIN32
+#define QEMU_SOCKET_RC_INPROGRESS(rc) \
+    ((rc) == -EINPROGRESS || (rc) == -EWOULDBLOCK || (rc) == -WSAEALREADY)
+#else
+#define QEMU_SOCKET_RC_INPROGRESS(rc) \
+    ((rc) == -EINPROGRESS)
 #endif
 
-    memset(&ai,0, sizeof(ai));
-    ai.ai_flags = AI_CANONNAME | AI_ADDRCONFIG;
-    ai.ai_family = PF_UNSPEC;
-    ai.ai_socktype = SOCK_STREAM;
+static int inet_connect_addr(struct addrinfo *addr, Error **errp);
 
-    addr = qemu_opt_get(opts, "host");
-    port = qemu_opt_get(opts, "port");
-    if (addr == NULL || port == NULL) {
-        fprintf(stderr, "inet_connect: host and/or port not specified\n");
+static int inet_connect_addr(struct addrinfo *addr, Error **errp)
+{
+    int sock, rc;
+
+    sock = qemu_socket(addr->ai_family, addr->ai_socktype, addr->ai_protocol);
+    if (sock < 0) {
+        error_setg_errno(errp, errno, "Failed to create socket");
+        return -1;
+    }
+    socket_set_fast_reuse(sock);
+
+    /* connect to peer */
+    do {
+        rc = 0;
+        if (connect(sock, addr->ai_addr, addr->ai_addrlen) < 0) {
+            rc = -errno;
+        }
+    } while (rc == -EINTR);
+
+    if (rc < 0) {
+        error_setg_errno(errp, errno, "Failed to connect socket");
+        closesocket(sock);
         return -1;
     }
 
-    if (qemu_opt_get_bool(opts, "ipv4", 0))
-        ai.ai_family = PF_INET;
-    if (qemu_opt_get_bool(opts, "ipv6", 0))
-        ai.ai_family = PF_INET6;
-
-    /* lookup */
-    if (0 != (rc = getaddrinfo(addr, port, &ai, &res))) {
-        fprintf(stderr,"getaddrinfo(%s,%s): %s\n", addr, port,
-                gai_strerror(rc));
-	return -1;
-    }
-    if (sockets_debug)
-        inet_print_addrinfo(__FUNCTION__, res);
-
-    for (e = res; e != NULL; e = e->ai_next) {
-        if (getnameinfo((struct sockaddr*)e->ai_addr,e->ai_addrlen,
-                            uaddr,INET6_ADDRSTRLEN,uport,32,
-                            NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-            fprintf(stderr,"%s: getnameinfo: oops\n", __FUNCTION__);
-            continue;
-        }
-        sock = qemu_socket(e->ai_family, e->ai_socktype, e->ai_protocol);
-        if (sock < 0) {
-            fprintf(stderr,"%s: socket(%s): %s\n", __FUNCTION__,
-            inet_strfamily(e->ai_family), strerror(errno));
-            continue;
-        }
-        qemu_setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(void*)&on,sizeof(on));
-
-        /* connect to peer */
-        if (connect(sock,e->ai_addr,e->ai_addrlen) < 0) {
-            if (sockets_debug || NULL == e->ai_next)
-                fprintf(stderr, "%s: connect(%s,%s,%s,%s): %s\n", __FUNCTION__,
-                        inet_strfamily(e->ai_family),
-                        e->ai_canonname, uaddr, uport, strerror(errno));
-            closesocket(sock);
-            continue;
-        }
-        if (sockets_debug)
-            fprintf(stderr, "%s: connect(%s,%s,%s,%s): OK\n", __FUNCTION__,
-                    inet_strfamily(e->ai_family),
-                    e->ai_canonname, uaddr, uport);
-        freeaddrinfo(res);
-        return sock;
-    }
-    freeaddrinfo(res);
-    return -1;
+    return sock;
 }
 
-int inet_dgram_opts(QemuOpts *opts)
+static struct addrinfo *inet_parse_connect_saddr(InetSocketAddress *saddr,
+                                                 Error **errp)
+{
+    struct addrinfo ai, *res;
+    int rc;
+    Error *err = NULL;
+    static int useV4Mapped = 1;
+
+    memset(&ai, 0, sizeof(ai));
+
+    ai.ai_flags = AI_CANONNAME | AI_ADDRCONFIG;
+    if (atomic_read(&useV4Mapped)) {
+        ai.ai_flags |= AI_V4MAPPED;
+    }
+    ai.ai_family = inet_ai_family_from_address(saddr, &err);
+    ai.ai_socktype = SOCK_STREAM;
+
+    if (err) {
+        error_propagate(errp, err);
+        return NULL;
+    }
+
+    if (saddr->host == NULL || saddr->port == NULL) {
+        error_setg(errp, "host and/or port not specified");
+        return NULL;
+    }
+
+    /* lookup */
+    rc = getaddrinfo(saddr->host, saddr->port, &ai, &res);
+
+    /* At least FreeBSD and OS-X 10.6 declare AI_V4MAPPED but
+     * then don't implement it in their getaddrinfo(). Detect
+     * this and retry without the flag since that's preferrable
+     * to a fatal error
+     */
+    if (rc == EAI_BADFLAGS &&
+        (ai.ai_flags & AI_V4MAPPED)) {
+        atomic_set(&useV4Mapped, 0);
+        ai.ai_flags &= ~AI_V4MAPPED;
+        rc = getaddrinfo(saddr->host, saddr->port, &ai, &res);
+    }
+    if (rc != 0) {
+        error_setg(errp, "address resolution failed for %s:%s: %s",
+                   saddr->host, saddr->port, gai_strerror(rc));
+        return NULL;
+    }
+    return res;
+}
+
+/**
+ * Create a socket and connect it to an address.
+ *
+ * @saddr: Inet socket address specification
+ * @errp: set on error
+ *
+ * Returns: -1 on error, file descriptor on success.
+ */
+int inet_connect_saddr(InetSocketAddress *saddr, Error **errp)
+{
+    Error *local_err = NULL;
+    struct addrinfo *res, *e;
+    int sock = -1;
+
+    res = inet_parse_connect_saddr(saddr, errp);
+    if (!res) {
+        return -1;
+    }
+
+    for (e = res; e != NULL; e = e->ai_next) {
+        error_free(local_err);
+        local_err = NULL;
+        sock = inet_connect_addr(e, &local_err);
+        if (sock >= 0) {
+            break;
+        }
+    }
+
+    if (sock < 0) {
+        error_propagate(errp, local_err);
+    }
+
+    freeaddrinfo(res);
+    return sock;
+}
+
+static int inet_dgram_saddr(InetSocketAddress *sraddr,
+                            InetSocketAddress *sladdr,
+                            Error **errp)
 {
     struct addrinfo ai, *peer = NULL, *local = NULL;
     const char *addr;
     const char *port;
-    char uaddr[INET6_ADDRSTRLEN+1];
-    char uport[33];
     int sock = -1, rc;
+    Error *err = NULL;
 
     /* lookup peer addr */
     memset(&ai,0, sizeof(ai));
-    ai.ai_flags = AI_CANONNAME | AI_ADDRCONFIG;
-    ai.ai_family = PF_UNSPEC;
+    ai.ai_flags = AI_CANONNAME | AI_V4MAPPED | AI_ADDRCONFIG;
+    ai.ai_family = inet_ai_family_from_address(sraddr, &err);
     ai.ai_socktype = SOCK_DGRAM;
 
-    addr = qemu_opt_get(opts, "host");
-    port = qemu_opt_get(opts, "port");
+    if (err) {
+        error_propagate(errp, err);
+        goto err;
+    }
+
+    addr = sraddr->host;
+    port = sraddr->port;
     if (addr == NULL || strlen(addr) == 0) {
         addr = "localhost";
     }
     if (port == NULL || strlen(port) == 0) {
-        fprintf(stderr, "inet_dgram: port not specified\n");
-        return -1;
+        error_setg(errp, "remote port not specified");
+        goto err;
     }
 
-    if (qemu_opt_get_bool(opts, "ipv4", 0))
-        ai.ai_family = PF_INET;
-    if (qemu_opt_get_bool(opts, "ipv6", 0))
-        ai.ai_family = PF_INET6;
-
-    if (0 != (rc = getaddrinfo(addr, port, &ai, &peer))) {
-        fprintf(stderr,"getaddrinfo(%s,%s): %s\n", addr, port,
-                gai_strerror(rc));
-	return -1;
-    }
-    if (sockets_debug) {
-        fprintf(stderr, "%s: peer (%s:%s)\n", __FUNCTION__, addr, port);
-        inet_print_addrinfo(__FUNCTION__, peer);
+    if ((rc = getaddrinfo(addr, port, &ai, &peer)) != 0) {
+        error_setg(errp, "address resolution failed for %s:%s: %s", addr, port,
+                   gai_strerror(rc));
+        goto err;
     }
 
     /* lookup local addr */
@@ -352,57 +503,43 @@ int inet_dgram_opts(QemuOpts *opts)
     ai.ai_family = peer->ai_family;
     ai.ai_socktype = SOCK_DGRAM;
 
-    addr = qemu_opt_get(opts, "localaddr");
-    port = qemu_opt_get(opts, "localport");
-    if (addr == NULL || strlen(addr) == 0) {
+    if (sladdr) {
+        addr = sladdr->host;
+        port = sladdr->port;
+        if (addr == NULL || strlen(addr) == 0) {
+            addr = NULL;
+        }
+        if (!port || strlen(port) == 0) {
+            port = "0";
+        }
+    } else {
         addr = NULL;
-    }
-    if (!port || strlen(port) == 0)
         port = "0";
-
-    if (0 != (rc = getaddrinfo(addr, port, &ai, &local))) {
-        fprintf(stderr,"getaddrinfo(%s,%s): %s\n", addr, port,
-                gai_strerror(rc));
-        return -1;
     }
-    if (sockets_debug) {
-        fprintf(stderr, "%s: local (%s:%s)\n", __FUNCTION__, addr, port);
-        inet_print_addrinfo(__FUNCTION__, local);
+
+    if ((rc = getaddrinfo(addr, port, &ai, &local)) != 0) {
+        error_setg(errp, "address resolution failed for %s:%s: %s", addr, port,
+                   gai_strerror(rc));
+        goto err;
     }
 
     /* create socket */
     sock = qemu_socket(peer->ai_family, peer->ai_socktype, peer->ai_protocol);
     if (sock < 0) {
-        fprintf(stderr,"%s: socket(%s): %s\n", __FUNCTION__,
-                inet_strfamily(peer->ai_family), strerror(errno));
+        error_setg_errno(errp, errno, "Failed to create socket");
         goto err;
     }
-    qemu_setsockopt(sock,SOL_SOCKET,SO_REUSEADDR,(void*)&on,sizeof(on));
+    socket_set_fast_reuse(sock);
 
     /* bind socket */
-    if (getnameinfo((struct sockaddr*)local->ai_addr,local->ai_addrlen,
-                    uaddr,INET6_ADDRSTRLEN,uport,32,
-                    NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-        fprintf(stderr, "%s: getnameinfo: oops\n", __FUNCTION__);
-        goto err;
-    }
     if (bind(sock, local->ai_addr, local->ai_addrlen) < 0) {
-        fprintf(stderr,"%s: bind(%s,%s,%d): OK\n", __FUNCTION__,
-                inet_strfamily(local->ai_family), uaddr, inet_getport(local));
+        error_setg_errno(errp, errno, "Failed to bind socket");
         goto err;
     }
 
     /* connect to peer */
-    if (getnameinfo((struct sockaddr*)peer->ai_addr, peer->ai_addrlen,
-                    uaddr, INET6_ADDRSTRLEN, uport, 32,
-                    NI_NUMERICHOST | NI_NUMERICSERV) != 0) {
-        fprintf(stderr, "%s: getnameinfo: oops\n", __FUNCTION__);
-        goto err;
-    }
     if (connect(sock,peer->ai_addr,peer->ai_addrlen) < 0) {
-        fprintf(stderr, "%s: connect(%s,%s,%s,%s): %s\n", __FUNCTION__,
-                inet_strfamily(peer->ai_family),
-                peer->ai_canonname, uaddr, uport, strerror(errno));
+        error_setg_errno(errp, errno, "Failed to connect socket");
         goto err;
     }
 
@@ -411,153 +548,311 @@ int inet_dgram_opts(QemuOpts *opts)
     return sock;
 
 err:
-    if (-1 != sock)
+    if (sock != -1) {
         closesocket(sock);
-    if (local)
+    }
+    if (local) {
         freeaddrinfo(local);
-    if (peer)
+    }
+    if (peer) {
         freeaddrinfo(peer);
+    }
+
     return -1;
 }
 
 /* compatibility wrapper */
-static int inet_parse(QemuOpts *opts, const char *str)
+static int inet_parse_flag(const char *flagname, const char *optstr, bool *val,
+                           Error **errp)
+{
+    char *end;
+    size_t len;
+
+    end = strstr(optstr, ",");
+    if (end) {
+        if (end[1] == ',') { /* Reject 'ipv6=on,,foo' */
+            error_setg(errp, "error parsing '%s' flag '%s'", flagname, optstr);
+            return -1;
+        }
+        len = end - optstr;
+    } else {
+        len = strlen(optstr);
+    }
+    if (len == 0 || (len == 3 && strncmp(optstr, "=on", len) == 0)) {
+        *val = true;
+    } else if (len == 4 && strncmp(optstr, "=off", len) == 0) {
+        *val = false;
+    } else {
+        error_setg(errp, "error parsing '%s' flag '%s'", flagname, optstr);
+        return -1;
+    }
+    return 0;
+}
+
+int inet_parse(InetSocketAddress *addr, const char *str, Error **errp)
 {
     const char *optstr, *h;
-    char addr[64];
+    char host[65];
     char port[33];
+    int to;
     int pos;
+    char *begin;
+
+    memset(addr, 0, sizeof(*addr));
 
     /* parse address */
     if (str[0] == ':') {
         /* no host given */
-        addr[0] = '\0';
-        if (1 != sscanf(str,":%32[^,]%n",port,&pos)) {
-            fprintf(stderr, "%s: portonly parse error (%s)\n",
-                    __FUNCTION__, str);
+        host[0] = '\0';
+        if (sscanf(str, ":%32[^,]%n", port, &pos) != 1) {
+            error_setg(errp, "error parsing port in address '%s'", str);
             return -1;
         }
     } else if (str[0] == '[') {
         /* IPv6 addr */
-        if (2 != sscanf(str,"[%64[^]]]:%32[^,]%n",addr,port,&pos)) {
-            fprintf(stderr, "%s: ipv6 parse error (%s)\n",
-                    __FUNCTION__, str);
+        if (sscanf(str, "[%64[^]]]:%32[^,]%n", host, port, &pos) != 2) {
+            error_setg(errp, "error parsing IPv6 address '%s'", str);
             return -1;
         }
-        qemu_opt_set(opts, "ipv6", "on");
-    } else if (qemu_isdigit(str[0])) {
-        /* IPv4 addr */
-        if (2 != sscanf(str,"%64[0-9.]:%32[^,]%n",addr,port,&pos)) {
-            fprintf(stderr, "%s: ipv4 parse error (%s)\n",
-                    __FUNCTION__, str);
-            return -1;
-        }
-        qemu_opt_set(opts, "ipv4", "on");
     } else {
-        /* hostname */
-        if (2 != sscanf(str,"%64[^:]:%32[^,]%n",addr,port,&pos)) {
-            fprintf(stderr, "%s: hostname parse error (%s)\n",
-                    __FUNCTION__, str);
+        /* hostname or IPv4 addr */
+        if (sscanf(str, "%64[^:]:%32[^,]%n", host, port, &pos) != 2) {
+            error_setg(errp, "error parsing address '%s'", str);
             return -1;
         }
     }
-    qemu_opt_set(opts, "host", addr);
-    qemu_opt_set(opts, "port", port);
+
+    addr->host = g_strdup(host);
+    addr->port = g_strdup(port);
 
     /* parse options */
     optstr = str + pos;
     h = strstr(optstr, ",to=");
-    if (h)
-        qemu_opt_set(opts, "to", h+4);
-    if (strstr(optstr, ",ipv4"))
-        qemu_opt_set(opts, "ipv4", "on");
-    if (strstr(optstr, ",ipv6"))
-        qemu_opt_set(opts, "ipv6", "on");
-#ifdef CONFIG_ANDROID
-    h = strstr(optstr, ",socket=");
     if (h) {
-        int socket_fd;
-        char str_fd[12];
-        if (1 != sscanf(h+7,"%d",&socket_fd)) {
-            fprintf(stderr,"%s: socket fd parse error (%s)\n",
-                    __FUNCTION__, h+7);
+        h += 4;
+        if (sscanf(h, "%d%n", &to, &pos) != 1 ||
+            (h[pos] != '\0' && h[pos] != ',')) {
+            error_setg(errp, "error parsing to= argument");
             return -1;
         }
-        if (socket_fd < 0 || socket_fd >= INT_MAX) {
-            fprintf(stderr,"%s: socket fd range error (%d)\n",
-                    __FUNCTION__, socket_fd);
-            return -1;
-        }
-        snprintf(str_fd, sizeof str_fd, "%d", socket_fd);
-        qemu_opt_set(opts, "socket", str_fd);
+        addr->has_to = true;
+        addr->to = to;
     }
-#endif
+    begin = strstr(optstr, ",ipv4");
+    if (begin) {
+        if (inet_parse_flag("ipv4", begin + 5, &addr->ipv4, errp) < 0) {
+            return -1;
+        }
+        addr->has_ipv4 = true;
+    }
+    begin = strstr(optstr, ",ipv6");
+    if (begin) {
+        if (inet_parse_flag("ipv6", begin + 5, &addr->ipv6, errp) < 0) {
+            return -1;
+        }
+        addr->has_ipv6 = true;
+    }
     return 0;
 }
 
-int inet_listen(const char *str, char *ostr, int olen,
-                int socktype, int port_offset)
-{
-    QemuOpts *opts;
-    char *optstr;
-    int sock = -1;
 
-    opts = qemu_opts_create(&dummy_opts, NULL, 0);
-    if (inet_parse(opts, str) == 0) {
-        sock = inet_listen_opts(opts, port_offset);
-        if (sock != -1 && ostr) {
-            optstr = strchr(str, ',');
-            if (qemu_opt_get_bool(opts, "ipv6", 0)) {
-                snprintf(ostr, olen, "[%s]:%s%s",
-                         qemu_opt_get(opts, "host"),
-                         qemu_opt_get(opts, "port"),
-                         optstr ? optstr : "");
-            } else {
-                snprintf(ostr, olen, "%s:%s%s",
-                         qemu_opt_get(opts, "host"),
-                         qemu_opt_get(opts, "port"),
-                         optstr ? optstr : "");
-            }
-        }
+/**
+ * Create a blocking socket and connect it to an address.
+ *
+ * @str: address string
+ * @errp: set in case of an error
+ *
+ * Returns -1 in case of error, file descriptor on success
+ **/
+int inet_connect(const char *str, Error **errp)
+{
+    int sock = -1;
+    InetSocketAddress *addr = g_new(InetSocketAddress, 1);
+
+    if (!inet_parse(addr, str, errp)) {
+        sock = inet_connect_saddr(addr, errp);
     }
-    qemu_opts_del(opts);
+    qapi_free_InetSocketAddress(addr);
     return sock;
 }
 
-int inet_connect(const char *str, int socktype)
+#ifdef CONFIG_AF_VSOCK
+static bool vsock_parse_vaddr_to_sockaddr(const VsockSocketAddress *vaddr,
+                                          struct sockaddr_vm *svm,
+                                          Error **errp)
 {
-    QemuOpts *opts;
-    int sock = -1;
+    unsigned long long val;
 
-    opts = qemu_opts_create(&dummy_opts, NULL, 0);
-    if (inet_parse(opts, str) == 0)
-        sock = inet_connect_opts(opts);
-    qemu_opts_del(opts);
-    return sock;
+    memset(svm, 0, sizeof(*svm));
+    svm->svm_family = AF_VSOCK;
+
+    if (parse_uint_full(vaddr->cid, &val, 10) < 0 ||
+        val > UINT32_MAX) {
+        error_setg(errp, "Failed to parse cid '%s'", vaddr->cid);
+        return false;
+    }
+    svm->svm_cid = val;
+
+    if (parse_uint_full(vaddr->port, &val, 10) < 0 ||
+        val > UINT32_MAX) {
+        error_setg(errp, "Failed to parse port '%s'", vaddr->port);
+        return false;
+    }
+    svm->svm_port = val;
+
+    return true;
 }
 
-#ifndef _WIN32
-
-int unix_listen_opts(QemuOpts *opts)
+static int vsock_connect_addr(const struct sockaddr_vm *svm, Error **errp)
 {
-    struct sockaddr_un un;
-    const char *path = qemu_opt_get(opts, "path");
-    int sock, fd;
+    int sock, rc;
 
-    sock = qemu_socket(PF_UNIX, SOCK_STREAM, 0);
+    sock = qemu_socket(AF_VSOCK, SOCK_STREAM, 0);
     if (sock < 0) {
-        perror("socket(unix)");
+        error_setg_errno(errp, errno, "Failed to create socket");
         return -1;
     }
 
-    memset(&un, 0, sizeof(un));
-    un.sun_family = AF_UNIX;
-    if (path && strlen(path)) {
-        snprintf(un.sun_path, sizeof(un.sun_path), "%s", path);
+    /* connect to peer */
+    do {
+        rc = 0;
+        if (connect(sock, (const struct sockaddr *)svm, sizeof(*svm)) < 0) {
+            rc = -errno;
+        }
+    } while (rc == -EINTR);
+
+    if (rc < 0) {
+        error_setg_errno(errp, errno, "Failed to connect socket");
+        closesocket(sock);
+        return -1;
+    }
+
+    return sock;
+}
+
+static int vsock_connect_saddr(VsockSocketAddress *vaddr, Error **errp)
+{
+    struct sockaddr_vm svm;
+    int sock = -1;
+
+    if (!vsock_parse_vaddr_to_sockaddr(vaddr, &svm, errp)) {
+        return -1;
+    }
+
+    sock = vsock_connect_addr(&svm, errp);
+
+    return sock;
+}
+
+static int vsock_listen_saddr(VsockSocketAddress *vaddr,
+                              Error **errp)
+{
+    struct sockaddr_vm svm;
+    int slisten;
+
+    if (!vsock_parse_vaddr_to_sockaddr(vaddr, &svm, errp)) {
+        return -1;
+    }
+
+    slisten = qemu_socket(AF_VSOCK, SOCK_STREAM, 0);
+    if (slisten < 0) {
+        error_setg_errno(errp, errno, "Failed to create socket");
+        return -1;
+    }
+
+    if (bind(slisten, (const struct sockaddr *)&svm, sizeof(svm)) != 0) {
+        error_setg_errno(errp, errno, "Failed to bind socket");
+        closesocket(slisten);
+        return -1;
+    }
+
+    if (listen(slisten, 1) != 0) {
+        error_setg_errno(errp, errno, "Failed to listen on socket");
+        closesocket(slisten);
+        return -1;
+    }
+    return slisten;
+}
+
+static int vsock_parse(VsockSocketAddress *addr, const char *str,
+                       Error **errp)
+{
+    char cid[33];
+    char port[33];
+    int n;
+
+    if (sscanf(str, "%32[^:]:%32[^,]%n", cid, port, &n) != 2) {
+        error_setg(errp, "error parsing address '%s'", str);
+        return -1;
+    }
+    if (str[n] != '\0') {
+        error_setg(errp, "trailing characters in address '%s'", str);
+        return -1;
+    }
+
+    addr->cid = g_strdup(cid);
+    addr->port = g_strdup(port);
+    return 0;
+}
+#else
+static void vsock_unsupported(Error **errp)
+{
+    error_setg(errp, "socket family AF_VSOCK unsupported");
+}
+
+static int vsock_connect_saddr(VsockSocketAddress *vaddr, Error **errp)
+{
+    vsock_unsupported(errp);
+    return -1;
+}
+
+static int vsock_listen_saddr(VsockSocketAddress *vaddr,
+                              Error **errp)
+{
+    vsock_unsupported(errp);
+    return -1;
+}
+
+static int vsock_parse(VsockSocketAddress *addr, const char *str,
+                        Error **errp)
+{
+    vsock_unsupported(errp);
+    return -1;
+}
+#endif /* CONFIG_AF_VSOCK */
+
+#ifndef _WIN32
+
+static int unix_listen_saddr(UnixSocketAddress *saddr,
+                             Error **errp)
+{
+    struct sockaddr_un un;
+    int sock, fd;
+    char *pathbuf = NULL;
+    const char *path;
+
+    sock = qemu_socket(PF_UNIX, SOCK_STREAM, 0);
+    if (sock < 0) {
+        error_setg_errno(errp, errno, "Failed to create Unix socket");
+        return -1;
+    }
+
+    if (saddr->path && saddr->path[0]) {
+        path = saddr->path;
     } else {
-        char *tmpdir = getenv("TMPDIR");
-        snprintf(un.sun_path, sizeof(un.sun_path), "%s/qemu-socket-XXXXXX",
-                 tmpdir ? tmpdir : "/tmp");
+        const char *tmpdir = getenv("TMPDIR");
+        tmpdir = tmpdir ? tmpdir : "/tmp";
+        path = pathbuf = g_strdup_printf("%s/qemu-socket-XXXXXX", tmpdir);
+    }
+
+    if (strlen(path) > sizeof(un.sun_path)) {
+        error_setg(errp, "UNIX socket path '%s' is too long", path);
+        error_append_hint(errp, "Path must be less than %zu bytes\n",
+                          sizeof(un.sun_path));
+        goto err;
+    }
+
+    if (pathbuf != NULL) {
         /*
          * This dummy fd usage silences the mktemp() unsecure warning.
          * Using mkstemp() doesn't make things more secure here
@@ -565,67 +860,117 @@ int unix_listen_opts(QemuOpts *opts)
          * to unlink first and thus re-open the race window.  The
          * worst case possible is bind() failing, i.e. a DoS attack.
          */
-        fd = mkstemp(un.sun_path); close(fd);
-        qemu_opt_set(opts, "path", un.sun_path);
+        fd = mkstemp(pathbuf);
+        if (fd < 0) {
+            error_setg_errno(errp, errno,
+                             "Failed to make a temporary socket %s", pathbuf);
+            goto err;
+        }
+        close(fd);
     }
 
-    unlink(un.sun_path);
+    if (unlink(path) < 0 && errno != ENOENT) {
+        error_setg_errno(errp, errno,
+                         "Failed to unlink socket %s", path);
+        goto err;
+    }
+
+    memset(&un, 0, sizeof(un));
+    un.sun_family = AF_UNIX;
+    strncpy(un.sun_path, path, sizeof(un.sun_path));
+
     if (bind(sock, (struct sockaddr*) &un, sizeof(un)) < 0) {
-        fprintf(stderr, "bind(unix:%s): %s\n", un.sun_path, strerror(errno));
+        error_setg_errno(errp, errno, "Failed to bind socket to %s", path);
         goto err;
     }
     if (listen(sock, 1) < 0) {
-        fprintf(stderr, "listen(unix:%s): %s\n", un.sun_path, strerror(errno));
+        error_setg_errno(errp, errno, "Failed to listen on socket");
         goto err;
     }
 
-    if (sockets_debug)
-        fprintf(stderr, "bind(unix:%s): OK\n", un.sun_path);
+    g_free(pathbuf);
     return sock;
 
 err:
+    g_free(pathbuf);
     closesocket(sock);
     return -1;
 }
 
-int unix_connect_opts(QemuOpts *opts)
+static int unix_connect_saddr(UnixSocketAddress *saddr, Error **errp)
 {
     struct sockaddr_un un;
-    const char *path = qemu_opt_get(opts, "path");
-    int sock;
+    int sock, rc;
 
-    if (NULL == path) {
-        fprintf(stderr, "unix connect: no path specified\n");
+    if (saddr->path == NULL) {
+        error_setg(errp, "unix connect: no path specified");
         return -1;
     }
 
     sock = qemu_socket(PF_UNIX, SOCK_STREAM, 0);
     if (sock < 0) {
-        perror("socket(unix)");
+        error_setg_errno(errp, errno, "Failed to create socket");
         return -1;
+    }
+
+    if (strlen(saddr->path) > sizeof(un.sun_path)) {
+        error_setg(errp, "UNIX socket path '%s' is too long", saddr->path);
+        error_append_hint(errp, "Path must be less than %zu bytes\n",
+                          sizeof(un.sun_path));
+        goto err;
     }
 
     memset(&un, 0, sizeof(un));
     un.sun_family = AF_UNIX;
-    snprintf(un.sun_path, sizeof(un.sun_path), "%s", path);
-    if (connect(sock, (struct sockaddr*) &un, sizeof(un)) < 0) {
-        fprintf(stderr, "connect(unix:%s): %s\n", path, strerror(errno));
-	return -1;
+    strncpy(un.sun_path, saddr->path, sizeof(un.sun_path));
+
+    /* connect to peer */
+    do {
+        rc = 0;
+        if (connect(sock, (struct sockaddr *) &un, sizeof(un)) < 0) {
+            rc = -errno;
+        }
+    } while (rc == -EINTR);
+
+    if (rc < 0) {
+        error_setg_errno(errp, -rc, "Failed to connect socket %s",
+                         saddr->path);
+        goto err;
     }
 
-    if (sockets_debug)
-        fprintf(stderr, "connect(unix:%s): OK\n", path);
     return sock;
+
+ err:
+    close(sock);
+    return -1;
 }
 
-/* compatibility wrapper */
-int unix_listen(const char *str, char *ostr, int olen)
+#else
+
+static int unix_listen_saddr(UnixSocketAddress *saddr,
+                             Error **errp)
 {
-    QemuOpts *opts;
+    error_setg(errp, "unix sockets are not available on windows");
+    errno = ENOTSUP;
+    return -1;
+}
+
+static int unix_connect_saddr(UnixSocketAddress *saddr, Error **errp)
+{
+    error_setg(errp, "unix sockets are not available on windows");
+    errno = ENOTSUP;
+    return -1;
+}
+#endif
+
+/* compatibility wrapper */
+int unix_listen(const char *str, Error **errp)
+{
     char *path, *optstr;
     int sock, len;
+    UnixSocketAddress *saddr;
 
-    opts = qemu_opts_create(&dummy_opts, NULL, 0);
+    saddr = g_new0(UnixSocketAddress, 1);
 
     optstr = strchr(str, ',');
     if (optstr) {
@@ -633,85 +978,358 @@ int unix_listen(const char *str, char *ostr, int olen)
         if (len) {
             path = g_malloc(len+1);
             snprintf(path, len+1, "%.*s", len, str);
-            qemu_opt_set(opts, "path", path);
-            g_free(path);
+            saddr->path = path;
         }
     } else {
-        qemu_opt_set(opts, "path", str);
+        saddr->path = g_strdup(str);
     }
 
-    sock = unix_listen_opts(opts);
+    sock = unix_listen_saddr(saddr, errp);
 
-    if (sock != -1 && ostr)
-        snprintf(ostr, olen, "%s%s", qemu_opt_get(opts, "path"), optstr ? optstr : "");
-    qemu_opts_del(opts);
+    qapi_free_UnixSocketAddress(saddr);
     return sock;
 }
 
-int unix_connect(const char *path)
+int unix_connect(const char *path, Error **errp)
 {
-    QemuOpts *opts;
+    UnixSocketAddress *saddr;
     int sock;
 
-    opts = qemu_opts_create(&dummy_opts, NULL, 0);
-    qemu_opt_set(opts, "path", path);
-    sock = unix_connect_opts(opts);
-    qemu_opts_del(opts);
+    saddr = g_new0(UnixSocketAddress, 1);
+    saddr->path = g_strdup(path);
+    sock = unix_connect_saddr(saddr, errp);
+    qapi_free_UnixSocketAddress(saddr);
     return sock;
 }
 
-#else
 
-int unix_listen_opts(QemuOpts *opts)
+SocketAddress *socket_parse(const char *str, Error **errp)
 {
-    fprintf(stderr, "unix sockets are not available on windows\n");
-    errno = ENOTSUP;
-    return -1;
+    SocketAddress *addr;
+
+    addr = g_new0(SocketAddress, 1);
+    if (strstart(str, "unix:", NULL)) {
+        if (str[5] == '\0') {
+            error_setg(errp, "invalid Unix socket address");
+            goto fail;
+        } else {
+            addr->type = SOCKET_ADDRESS_TYPE_UNIX;
+            addr->u.q_unix.path = g_strdup(str + 5);
+        }
+    } else if (strstart(str, "fd:", NULL)) {
+        if (str[3] == '\0') {
+            error_setg(errp, "invalid file descriptor address");
+            goto fail;
+        } else {
+            addr->type = SOCKET_ADDRESS_TYPE_FD;
+            addr->u.fd.str = g_strdup(str + 3);
+        }
+    } else if (strstart(str, "vsock:", NULL)) {
+        addr->type = SOCKET_ADDRESS_TYPE_VSOCK;
+        if (vsock_parse(&addr->u.vsock, str + strlen("vsock:"), errp)) {
+            goto fail;
+        }
+    } else {
+        addr->type = SOCKET_ADDRESS_TYPE_INET;
+        if (inet_parse(&addr->u.inet, str, errp)) {
+            goto fail;
+        }
+    }
+    return addr;
+
+fail:
+    qapi_free_SocketAddress(addr);
+    return NULL;
 }
 
-int unix_connect_opts(QemuOpts *opts)
+static int socket_get_fd(const char *fdstr, Error **errp)
 {
-    fprintf(stderr, "unix sockets are not available on windows\n");
-    errno = ENOTSUP;
-    return -1;
-}
-
-int unix_listen(const char *path, char *ostr, int olen)
-{
-    fprintf(stderr, "unix sockets are not available on windows\n");
-    errno = ENOTSUP;
-    return -1;
-}
-
-int unix_connect(const char *path)
-{
-    fprintf(stderr, "unix sockets are not available on windows\n");
-    errno = ENOTSUP;
-    return -1;
-}
-
-#endif
-
-#ifdef _WIN32
-static void socket_cleanup(void)
-{
-    WSACleanup();
-}
-#endif
-
-int socket_init(void)
-{
-#ifdef _WIN32
-    WSADATA Data;
-    int ret, err;
-
-    ret = WSAStartup(MAKEWORD(2,2), &Data);
-    if (ret != 0) {
-        err = WSAGetLastError();
-        fprintf(stderr, "WSAStartup: %d\n", err);
+    int fd;
+    if (cur_mon) {
+        fd = monitor_get_fd(cur_mon, fdstr, errp);
+        if (fd < 0) {
+            return -1;
+        }
+    } else {
+        if (qemu_strtoi(fdstr, NULL, 10, &fd) < 0) {
+            error_setg_errno(errp, errno,
+                             "Unable to parse FD number %s",
+                             fdstr);
+            return -1;
+        }
+    }
+    if (!fd_is_socket(fd)) {
+        error_setg(errp, "File descriptor '%s' is not a socket", fdstr);
+        close(fd);
         return -1;
     }
-    atexit(socket_cleanup);
+    return fd;
+}
+
+int socket_connect(SocketAddress *addr, Error **errp)
+{
+    int fd;
+
+    switch (addr->type) {
+    case SOCKET_ADDRESS_TYPE_INET:
+        fd = inet_connect_saddr(&addr->u.inet, errp);
+        break;
+
+    case SOCKET_ADDRESS_TYPE_UNIX:
+        fd = unix_connect_saddr(&addr->u.q_unix, errp);
+        break;
+
+    case SOCKET_ADDRESS_TYPE_FD:
+        fd = socket_get_fd(addr->u.fd.str, errp);
+        break;
+
+    case SOCKET_ADDRESS_TYPE_VSOCK:
+        fd = vsock_connect_saddr(&addr->u.vsock, errp);
+        break;
+
+    default:
+        abort();
+    }
+    return fd;
+}
+
+int socket_listen(SocketAddress *addr, Error **errp)
+{
+    int fd;
+
+    switch (addr->type) {
+    case SOCKET_ADDRESS_TYPE_INET:
+        fd = inet_listen_saddr(&addr->u.inet, 0, errp);
+        break;
+
+    case SOCKET_ADDRESS_TYPE_UNIX:
+        fd = unix_listen_saddr(&addr->u.q_unix, errp);
+        break;
+
+    case SOCKET_ADDRESS_TYPE_FD:
+        fd = socket_get_fd(addr->u.fd.str, errp);
+        break;
+
+    case SOCKET_ADDRESS_TYPE_VSOCK:
+        fd = vsock_listen_saddr(&addr->u.vsock, errp);
+        break;
+
+    default:
+        abort();
+    }
+    return fd;
+}
+
+void socket_listen_cleanup(int fd, Error **errp)
+{
+    SocketAddress *addr;
+
+    addr = socket_local_address(fd, errp);
+    if (!addr) {
+        return;
+    }
+
+    if (addr->type == SOCKET_ADDRESS_TYPE_UNIX
+        && addr->u.q_unix.path) {
+        if (unlink(addr->u.q_unix.path) < 0 && errno != ENOENT) {
+            error_setg_errno(errp, errno,
+                             "Failed to unlink socket %s",
+                             addr->u.q_unix.path);
+        }
+    }
+
+    qapi_free_SocketAddress(addr);
+}
+
+int socket_dgram(SocketAddress *remote, SocketAddress *local, Error **errp)
+{
+    int fd;
+
+    /*
+     * TODO SOCKET_ADDRESS_TYPE_FD when fd is AF_INET or AF_INET6
+     * (although other address families can do SOCK_DGRAM, too)
+     */
+    switch (remote->type) {
+    case SOCKET_ADDRESS_TYPE_INET:
+        fd = inet_dgram_saddr(&remote->u.inet,
+                              local ? &local->u.inet : NULL, errp);
+        break;
+
+    default:
+        error_setg(errp, "socket type unsupported for datagram");
+        fd = -1;
+    }
+    return fd;
+}
+
+
+static SocketAddress *
+socket_sockaddr_to_address_inet(struct sockaddr_storage *sa,
+                                socklen_t salen,
+                                Error **errp)
+{
+    char host[NI_MAXHOST];
+    char serv[NI_MAXSERV];
+    SocketAddress *addr;
+    InetSocketAddress *inet;
+    int ret;
+
+    ret = getnameinfo((struct sockaddr *)sa, salen,
+                      host, sizeof(host),
+                      serv, sizeof(serv),
+                      NI_NUMERICHOST | NI_NUMERICSERV);
+    if (ret != 0) {
+        error_setg(errp, "Cannot format numeric socket address: %s",
+                   gai_strerror(ret));
+        return NULL;
+    }
+
+    addr = g_new0(SocketAddress, 1);
+    addr->type = SOCKET_ADDRESS_TYPE_INET;
+    inet = &addr->u.inet;
+    inet->host = g_strdup(host);
+    inet->port = g_strdup(serv);
+    if (sa->ss_family == AF_INET) {
+        inet->has_ipv4 = inet->ipv4 = true;
+    } else {
+        inet->has_ipv6 = inet->ipv6 = true;
+    }
+
+    return addr;
+}
+
+
+#ifndef WIN32
+static SocketAddress *
+socket_sockaddr_to_address_unix(struct sockaddr_storage *sa,
+                                socklen_t salen,
+                                Error **errp)
+{
+    SocketAddress *addr;
+    struct sockaddr_un *su = (struct sockaddr_un *)sa;
+
+    addr = g_new0(SocketAddress, 1);
+    addr->type = SOCKET_ADDRESS_TYPE_UNIX;
+    if (su->sun_path[0]) {
+        addr->u.q_unix.path = g_strndup(su->sun_path, sizeof(su->sun_path));
+    }
+
+    return addr;
+}
+#endif /* WIN32 */
+
+#ifdef CONFIG_AF_VSOCK
+static SocketAddress *
+socket_sockaddr_to_address_vsock(struct sockaddr_storage *sa,
+                                 socklen_t salen,
+                                 Error **errp)
+{
+    SocketAddress *addr;
+    VsockSocketAddress *vaddr;
+    struct sockaddr_vm *svm = (struct sockaddr_vm *)sa;
+
+    addr = g_new0(SocketAddress, 1);
+    addr->type = SOCKET_ADDRESS_TYPE_VSOCK;
+    vaddr = &addr->u.vsock;
+    vaddr->cid = g_strdup_printf("%u", svm->svm_cid);
+    vaddr->port = g_strdup_printf("%u", svm->svm_port);
+
+    return addr;
+}
+#endif /* CONFIG_AF_VSOCK */
+
+SocketAddress *
+socket_sockaddr_to_address(struct sockaddr_storage *sa,
+                           socklen_t salen,
+                           Error **errp)
+{
+    switch (sa->ss_family) {
+    case AF_INET:
+    case AF_INET6:
+        return socket_sockaddr_to_address_inet(sa, salen, errp);
+
+#ifndef WIN32
+    case AF_UNIX:
+        return socket_sockaddr_to_address_unix(sa, salen, errp);
+#endif /* WIN32 */
+
+#ifdef CONFIG_AF_VSOCK
+    case AF_VSOCK:
+        return socket_sockaddr_to_address_vsock(sa, salen, errp);
 #endif
+
+    default:
+        error_setg(errp, "socket family %d unsupported",
+                   sa->ss_family);
+        return NULL;
+    }
     return 0;
+}
+
+
+SocketAddress *socket_local_address(int fd, Error **errp)
+{
+    struct sockaddr_storage ss;
+    socklen_t sslen = sizeof(ss);
+
+    if (getsockname(fd, (struct sockaddr *)&ss, &sslen) < 0) {
+        error_setg_errno(errp, errno, "%s",
+                         "Unable to query local socket address");
+        return NULL;
+    }
+
+    return socket_sockaddr_to_address(&ss, sslen, errp);
+}
+
+
+SocketAddress *socket_remote_address(int fd, Error **errp)
+{
+    struct sockaddr_storage ss;
+    socklen_t sslen = sizeof(ss);
+
+    if (getpeername(fd, (struct sockaddr *)&ss, &sslen) < 0) {
+        error_setg_errno(errp, errno, "%s",
+                         "Unable to query remote socket address");
+        return NULL;
+    }
+
+    return socket_sockaddr_to_address(&ss, sslen, errp);
+}
+
+
+SocketAddress *socket_address_flatten(SocketAddressLegacy *addr_legacy)
+{
+    SocketAddress *addr;
+
+    if (!addr_legacy) {
+        return NULL;
+    }
+
+    addr = g_new(SocketAddress, 1);
+
+    switch (addr_legacy->type) {
+    case SOCKET_ADDRESS_LEGACY_KIND_INET:
+        addr->type = SOCKET_ADDRESS_TYPE_INET;
+        QAPI_CLONE_MEMBERS(InetSocketAddress, &addr->u.inet,
+                           addr_legacy->u.inet.data);
+        break;
+    case SOCKET_ADDRESS_LEGACY_KIND_UNIX:
+        addr->type = SOCKET_ADDRESS_TYPE_UNIX;
+        QAPI_CLONE_MEMBERS(UnixSocketAddress, &addr->u.q_unix,
+                           addr_legacy->u.q_unix.data);
+        break;
+    case SOCKET_ADDRESS_LEGACY_KIND_VSOCK:
+        addr->type = SOCKET_ADDRESS_TYPE_VSOCK;
+        QAPI_CLONE_MEMBERS(VsockSocketAddress, &addr->u.vsock,
+                           addr_legacy->u.vsock.data);
+        break;
+    case SOCKET_ADDRESS_LEGACY_KIND_FD:
+        addr->type = SOCKET_ADDRESS_TYPE_FD;
+        QAPI_CLONE_MEMBERS(String, &addr->u.fd, addr_legacy->u.fd.data);
+        break;
+    default:
+        abort();
+    }
+
+    return addr;
 }

@@ -1,7 +1,5 @@
 #ifndef CPU_COMMON_H
-#define CPU_COMMON_H 1
-
-#include "qemu-common.h"
+#define CPU_COMMON_H
 
 /* CPU interfaces that are target independent.  */
 
@@ -9,12 +7,9 @@
 #include "exec/hwaddr.h"
 #endif
 
-#ifndef NEED_CPU_H
-#include "exec/poison.h"
-#endif
-
 #include "qemu/bswap.h"
 #include "qemu/queue.h"
+#include "qemu/fprintf-fn.h"
 
 /**
  * CPUListState:
@@ -28,6 +23,13 @@ typedef struct CPUListState {
     FILE *file;
 } CPUListState;
 
+/* The CPU list lock nests outside tb_lock/tb_unlock.  */
+void qemu_init_cpu_list(void);
+void cpu_list_lock(void);
+void cpu_list_unlock(void);
+
+void tcg_flush_softmmu_tlb(CPUState *cs);
+
 #if !defined(CONFIG_USER_ONLY)
 
 enum device_endian {
@@ -35,6 +37,12 @@ enum device_endian {
     DEVICE_BIG_ENDIAN,
     DEVICE_LITTLE_ENDIAN,
 };
+
+#if defined(HOST_WORDS_BIGENDIAN)
+#define DEVICE_HOST_ENDIAN DEVICE_BIG_ENDIAN
+#else
+#define DEVICE_HOST_ENDIAN DEVICE_LITTLE_ENDIAN
+#endif
 
 /* address in the RAM (different from a physical address) */
 #if defined(CONFIG_XEN_BACKEND)
@@ -47,106 +55,88 @@ typedef uintptr_t ram_addr_t;
 #  define RAM_ADDR_FMT "%" PRIxPTR
 #endif
 
+extern ram_addr_t ram_size;
+
 /* memory API */
-
-/* MMIO pages are identified by a combination of an IO device index and
-   3 flags.  The ROMD code stores the page ram offset in iotlb entry,
-   so only a limited number of ids are avaiable.  */
-
-#define IO_MEM_NB_ENTRIES  (1 << (TARGET_PAGE_BITS  - IO_MEM_SHIFT))
 
 typedef void CPUWriteMemoryFunc(void *opaque, hwaddr addr, uint32_t value);
 typedef uint32_t CPUReadMemoryFunc(void *opaque, hwaddr addr);
 
-void cpu_register_physical_memory_log(hwaddr start_addr,
-                                      ram_addr_t size,
-                                      ram_addr_t phys_offset,
-                                      ram_addr_t region_offset,
-                                      bool log_dirty);
+void qemu_ram_remap(ram_addr_t addr, ram_addr_t length);
+/* This should not be used by devices.  */
+ram_addr_t qemu_ram_addr_from_host(void *ptr);
+RAMBlock *qemu_ram_block_by_name(const char *name);
+RAMBlock *qemu_ram_block_from_host(void *ptr, bool round_offset,
+                                   ram_addr_t *offset);
+ram_addr_t qemu_ram_block_host_offset(RAMBlock *rb, void *host);
+void qemu_ram_set_idstr(RAMBlock *block, const char *name, DeviceState *dev);
+void qemu_ram_unset_idstr(RAMBlock *block);
+void qemu_ram_set_migrate(RAMBlock *block, bool migrate);
+const char *qemu_ram_get_idstr(RAMBlock *rb);
+bool qemu_ram_is_migrate(RAMBlock* rb);
+bool qemu_ram_is_shared(RAMBlock *rb);
+bool qemu_ram_is_uf_zeroable(RAMBlock *rb);
+void qemu_ram_set_uf_zeroable(RAMBlock *rb);
 
-static inline void cpu_register_physical_memory_offset(hwaddr start_addr,
-                                                       ram_addr_t size,
-                                                       ram_addr_t phys_offset,
-                                                       ram_addr_t region_offset)
-{
-    cpu_register_physical_memory_log(start_addr, size, phys_offset,
-                                     region_offset, false);
-}
+size_t qemu_ram_pagesize(RAMBlock *block);
+size_t qemu_ram_pagesize_largest(void);
 
-static inline void cpu_register_physical_memory(hwaddr start_addr,
-                                                ram_addr_t size,
-                                                ram_addr_t phys_offset)
-{
-    cpu_register_physical_memory_offset(start_addr, size, phys_offset, 0);
-}
-
-ram_addr_t cpu_get_physical_page_desc(hwaddr addr);
-
-int cpu_register_io_memory(CPUReadMemoryFunc * const *mem_read,
-                           CPUWriteMemoryFunc * const *mem_write,
-                           void *opaque);
-void cpu_unregister_io_memory(int table_address);
-
-void cpu_physical_memory_rw(hwaddr addr, void *buf,
+void cpu_physical_memory_rw(hwaddr addr, uint8_t *buf,
                             int len, int is_write);
 static inline void cpu_physical_memory_read(hwaddr addr,
                                             void *buf, int len)
 {
-    cpu_physical_memory_rw(addr, buf, len, 0);
+    cpu_physical_memory_rw(addr, (uint8_t*)buf, len, 0);
 }
 static inline void cpu_physical_memory_write(hwaddr addr,
                                              const void *buf, int len)
 {
-    cpu_physical_memory_rw(addr, (void*)buf, len, 1);
+    cpu_physical_memory_rw(addr, (uint8_t*)buf, len, 1);
 }
 void *cpu_physical_memory_map(hwaddr addr,
                               hwaddr *plen,
                               int is_write);
 void cpu_physical_memory_unmap(void *buffer, hwaddr len,
                                int is_write, hwaddr access_len);
-void *cpu_register_map_client(void *opaque, void (*callback)(void *opaque));
+void cpu_register_map_client(QEMUBH *bh);
+void cpu_unregister_map_client(QEMUBH *bh);
 
-uint32_t ldub_phys(hwaddr addr);
-uint32_t lduw_le_phys(hwaddr addr);
-uint32_t lduw_be_phys(hwaddr addr);
-uint32_t ldl_le_phys(hwaddr addr);
-uint32_t ldl_be_phys(hwaddr addr);
-uint64_t ldq_le_phys(hwaddr addr);
-uint64_t ldq_be_phys(hwaddr addr);
-void stb_phys(hwaddr addr, uint32_t val);
-void stw_le_phys(hwaddr addr, uint32_t val);
-void stw_be_phys(hwaddr addr, uint32_t val);
-void stl_le_phys(hwaddr addr, uint32_t val);
-void stl_be_phys(hwaddr addr, uint32_t val);
-void stq_le_phys(hwaddr addr, uint64_t val);
-void stq_be_phys(hwaddr addr, uint64_t val);
+bool cpu_physical_memory_is_io(hwaddr phys_addr);
 
-#ifdef NEED_CPU_H
-uint32_t lduw_phys(hwaddr addr);
-uint32_t ldl_phys(hwaddr addr);
-uint64_t ldq_phys(hwaddr addr);
-void stl_phys_notdirty(hwaddr addr, uint32_t val);
-void stq_phys_notdirty(hwaddr addr, uint64_t val);
-void stw_phys(hwaddr addr, uint32_t val);
-void stl_phys(hwaddr addr, uint32_t val);
-void stq_phys(hwaddr addr, uint64_t val);
-#endif
+/* Coalesced MMIO regions are areas where write operations can be reordered.
+ * This usually implies that write operations are side-effect free.  This allows
+ * batching which can make a major impact on performance when using
+ * virtualization.
+ */
+void qemu_flush_coalesced_mmio_buffer(void);
 
-void cpu_physical_memory_write_rom(hwaddr addr,
-                                   const void *buf, int len);
+void cpu_physical_memory_write_rom(AddressSpace *as, hwaddr addr,
+                                   const uint8_t *buf, int len);
+void cpu_flush_icache_range(hwaddr start, int len);
 
-#define IO_MEM_SHIFT       3
+extern struct MemoryRegion io_mem_rom;
+extern struct MemoryRegion io_mem_notdirty;
 
-#define IO_MEM_RAM         (0 << IO_MEM_SHIFT) /* hardcoded offset */
-#define IO_MEM_ROM         (1 << IO_MEM_SHIFT) /* hardcoded offset */
-#define IO_MEM_UNASSIGNED  (2 << IO_MEM_SHIFT)
-#define IO_MEM_NOTDIRTY    (3 << IO_MEM_SHIFT)
+typedef int (RAMBlockIterFunc)(const char *block_name, void *host_addr,
+    ram_addr_t offset, ram_addr_t length, void *opaque);
 
-/* Acts like a ROM when read and like a device when written.  */
-#define IO_MEM_ROMD        (1)
-#define IO_MEM_SUBPAGE     (2)
-#define IO_MEM_SUBWIDTH    (4)
+int qemu_ram_foreach_block(RAMBlockIterFunc func, void *opaque);
+int ram_block_discard_range(RAMBlock *rb, uint64_t start, size_t length);
+
+typedef int (RAMBlockIterFuncWithFileInfo)(
+    const char *block_name,
+    void *host_addr,
+    ram_addr_t offset,
+    ram_addr_t length,
+    uint32_t flags,
+    const char* path,
+    bool readonly,
+    void *opaque);
+
+int qemu_ram_foreach_migrate_block_with_file_info(
+    RAMBlockIterFuncWithFileInfo func,
+    void *opaque);
 
 #endif
 
-#endif /* !CPU_COMMON_H */
+#endif /* CPU_COMMON_H */

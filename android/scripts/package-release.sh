@@ -26,10 +26,6 @@ shell_import utils/package_builder.shi
 ###  CONFIGURATION DEFAULTS
 ###
 
-# The list of AOSP directories that contain relevant sources for this
-# script.
-AOSP_SOURCE_SUBDIRS="external/qemu external/qemu-android external/gtest"
-
 # Default package output directory.
 DEFAULT_PKG_DIR=/tmp
 
@@ -40,17 +36,17 @@ DEFAULT_PKG_PREFIX=android-emulator
 DEFAULT_REVISION=$(date +%Y%m%d)
 
 # The list of GPU emulation libraries.
-EMUGL_LIBRARIES="OpenglRender EGL_translator GLES_CM_translator GLES_V2_translator"
+EMUGL_LIBRARIES="OpenglRender EGL_translator GLES_CM_translator GLES_V2_translator GLES12Translator"
 
 # The list of Emugl backend directories under $EXEC_DIR/<lib>/
-EMUGL_BACKEND_DIRS="gles_mesa"
+EMUGL_BACKEND_DIRS="gles_mesa gles_swiftshader gles_angle"
 
 ###
 ###  UTILITY FUNCTIONS
 ###
 
 # Get the name of a variable matching a directory name.
-# $1: subdirectory name (e.g. 'external/qemu-android')
+# $1: subdirectory name (e.g. 'external/qemu')
 # Out: variable name (e.g. 'AOSP_COMMIT_external_qemu_android')
 _get_aosp_subdir_varname () {
     local __aosp_subdir="$1"
@@ -206,7 +202,7 @@ list_files_under () {
 # $2: Source directory
 # $3+: List of files/directories to package.
 package_archive_files () {
-    local PKG_FILE PKG_DIR TMP_FILE_LIST TARFLAGS RET FILTER FILE FILES
+    local PKG_FILE PKG_DIR TMP_FILE_LIST SEPTARFLAGS TARFLAGS RET FILTER FILE FILES
     PKG_FILE=$1
     PKG_DIR=$2
     shift; shift;
@@ -220,13 +216,25 @@ package_archive_files () {
             TARFLAGS=""
             ;;
         *.tar.gz)
-            TARFLAGS=z
+            if ! type "pigz" &>/dev/null ; then
+                TARFLAGS=z
+            else
+                SEPTARFLAGS="-I pigz"
+            fi
             ;;
         *.tar.bz2)
-            TARFLAGS=j
+            if ! type "pbzip2" &>/dev/null ; then
+                TARFLAGS=j
+            else
+                SEPTARFLAGS="-I pbzip2"
+            fi
             ;;
         *.tar.xz)
-            TARFLAGS=J
+            if ! type "pxz" &>/dev/null ; then
+                TARFLAGS=J
+            else
+                SEPTARFLAGS="-I pxz"
+            fi
             ;;
         *)
             panic "Don't know how to create package: $PKG_FILE"
@@ -237,7 +245,7 @@ package_archive_files () {
     fi
 
     RET=0
-    run tar c${TARFLAGS}f "$PKG_FILE" \
+    run tar ${SEPTARFLAGS} -c${TARFLAGS}f "$PKG_FILE" \
             -C "$PKG_DIR" \
             -T "$TMP_FILE_LIST" \
             --owner=android \
@@ -324,9 +332,45 @@ OPT_COPY_PREBUILTS=
 option_register_var "--copy-prebuilts=<dir>" OPT_COPY_PREBUILTS \
         "Copy final emulator binaries to <path>/prebuilts/android-emulator"
 
-OPT_UI=
-option_register_var "--ui=<name>" OPT_UI \
-        "Specify UI backend ('sdl2' or 'qt')"
+OPT_GLES=
+option_register_var "--gles=<name>" OPT_GLES \
+        "Specify GLES backend ('dgl' or 'angle')"
+
+OPT_NO_STRIP=
+option_register_var "--no-strip" OPT_NO_STRIP \
+        "Do not strip final binaries."
+
+OPT_SYMBOLS=
+option_register_var "--symbols" OPT_SYMBOLS \
+       "Generate Breakpad symbols."
+
+OPT_DEBUG=
+option_register_var "--debug" OPT_DEBUG \
+        "Build debug version of emulator binaries."
+
+OPT_PREBUILT_QEMU2=
+option_register_var "--prebuilt-qemu2" OPT_PREBUILT_QEMU2 \
+       "Don't build QEMU2 from sources, use prebuilts."
+
+OPT_CRASH_STAGING=
+option_register_var "--crash-staging" OPT_CRASH_STAGING \
+       "Upload crashes to staging."
+
+OPT_CRASH_PROD=
+option_register_var "--crash-prod" OPT_CRASH_PROD \
+       "Upload crashes to production."
+
+OPT_CLANG=
+option_register_var "--clang" OPT_CLANG \
+       "Compile using clang when available."
+
+OPT_NO_TESTS=
+option_register_var "--no-tests" OPT_NO_TESTS \
+       "Do not run tests after build completes."
+
+OPT_TRACE=
+option_register_var "--trace" OPT_TRACE \
+       "Enable tracing"
 
 package_builder_register_options
 aosp_prebuilts_dir_register_options
@@ -351,6 +395,9 @@ Use --darwin-ssh=<host> to build perform a remote build of the Darwin
 binaries on a remote host through ssh. Note that this forces --sources
 as well. You can also define ANDROID_EMULATOR_DARWIN_SSH in your
 environment to setup a default value for this option.
+
+Use --ssh-wrapper=<command> to prefix <command> to any SSH/SCP/RSYNC command
+performed by this script.
 
 Use --copy-prebuilts=<path> to specify the path of an AOSP workspace/checkout,
 and to copy 64-bit prebuilt binaries for all 3 host platforms to
@@ -420,9 +467,6 @@ fi
 ###
 
 REBUILD_FLAGS="--verbosity=$(get_verbosity)"
-if [ "$OPT_DEBUG" ]; then
-    var_append REBUILD_FLAGS "--debug"
-fi
 
 log "Building for the following systems: $HOST_SYSTEMS"
 
@@ -434,7 +478,7 @@ cd $QEMU_DIR
 if [ ! -d "$QEMU_DIR"/.git ]; then
     panic "This directory must be a checkout of \$AOSP/platform/external/qemu!"
 fi
-UNCHECKED_FILES=$(git ls-files -o -x objs/ -x images/emulator_icon32.o -x images/emulator_icon64.o)
+UNCHECKED_FILES=$(git ls-files -o --exclude-standard)
 if [ "$UNCHECKED_FILES" ]; then
     dump "ERROR: There are unchecked files in the current directory!"
     dump "Please remove them:"
@@ -442,10 +486,28 @@ if [ "$UNCHECKED_FILES" ]; then
     exit 1
 fi
 
+# The list of AOSP directories that contain relevant sources for this
+# script.
+
+# Create a fake AOSP root-directory with symlinks to the actual source
+# directories, this makes it easier to support alternative QEMU2 source dirs.
+AOSP_ROOT=$QEMU_DIR/../..
+AOSP_TMPDIR=$TEMP_DIR/aosp
+rm -rf "$AOSP_TMPDIR"/*
+mkdir -p "$AOSP_TMPDIR"/external
+ln -s "$AOSP_ROOT"/prebuilts "$AOSP_TMPDIR"/prebuilts
+ln -s "$AOSP_ROOT"/external/qemu "$AOSP_TMPDIR"/external/qemu
+ln -s "$AOSP_ROOT"/external/gtest "$AOSP_TMPDIR"/external/gtest
+ln -s "$AOSP_ROOT"/external/google-benchmark "$AOSP_TMPDIR"/external/google-benchmark
+ln -s "$AOSP_ROOT"/external/libyuv "$AOSP_TMPDIR"/external/libyuv
+ln -s "$AOSP_ROOT"/external/tinyobjloader "$AOSP_TMPDIR"/external/tinyobjloader
+
+AOSP_SOURCE_SUBDIRS="external/qemu external/gtest external/google-benchmark external/libyuv external/tinyobjloader"
+
 for AOSP_SUBDIR in $AOSP_SOURCE_SUBDIRS; do
     extract_subdir_git_history \
             $AOSP_SUBDIR \
-            "$QEMU_DIR"/../.. \
+            "$AOSP_TMPDIR" \
             "$TARGET_PREBUILTS_DIR"
 done
 
@@ -459,7 +521,7 @@ if [ "$OPT_SOURCES" ]; then
     PKG_NAME="$PKG_REVISION-sources"
     for AOSP_SUBDIR in $AOSP_SOURCE_SUBDIRS; do
         dump "[$PKG_NAME] Copying $AOSP_SUBDIR source files."
-        copy_directory_git_files "$QEMU_DIR/../../$AOSP_SUBDIR" "$BUILD_DIR"/$(basename $AOSP_SUBDIR)
+        copy_directory_git_files "$AOSP_TMPDIR"/$AOSP_SUBDIR "$BUILD_DIR"/$(basename $AOSP_SUBDIR)
     done
 
     dump "[$PKG_NAME] Generating README file."
@@ -476,7 +538,7 @@ EOF
 # from sources.
 
 cd \$(dirname "\$0") &&
-(cd qemu && ./android-rebuild.sh --ignore-audio "\$@") &&
+(cd qemu && ./android/rebuild.sh --ignore-audio "\$@") &&
 mkdir -p bin/ &&
 cp -rfp qemu/objs/emulator* bin/ &&
 echo "Emulator binaries are under \$(pwd -P)/bin/"
@@ -504,35 +566,35 @@ create_binaries_package () {
     dump "[$PKG_NAME] Copying emulator binaries."
     TEMP_PKG_DIR=$TEMP_DIR/$SYSTEM/$PKG_PREFIX-$PKG_REVISION
 
+
+    dump "[$PKG_NAME] Copying emulator binaries."
     FILE=emulator$EXEEXT
     copy_file_into objs/$FILE "$TEMP_PKG_DIR"/tools/
+    EMULATOR_BINARIES=$(list_files_under objs "emulator-*$EXEEXT" "emulator64-*$EXEEXT")
+    copy_directory_files objs "$TEMP_PKG_DIR"/tools/ $EMULATOR_BINARIES
+    if [ -d "objs/bin" ]; then
+        dump "[$PKG_NAME] Copying 32-bit executables."
+        copy_directory objs/bin "$TEMP_PKG_DIR"/tools/bin
+    fi
+    if [ -d "objs/bin64" ]; then
+        dump "[$PKG_NAME] Copying 64-bit executables."
+        copy_directory objs/bin64 "$TEMP_PKG_DIR"/tools/bin64
+    fi
     if [ -d "objs/lib" ]; then
-        for FILE in objs/emulator-*; do
-            copy_file_into $FILE "$TEMP_PKG_DIR"/tools/
-        done
-        dump "[$PKG_NAME] Copying 32-bit GLES emulation libraries."
-        for LIB in $EMUGL_LIBRARIES; do
-            copy_file_into objs/lib/lib$LIB$DLLEXT \
-                           "$TEMP_PKG_DIR"/tools/lib/
-        done
+        dump "[$PKG_NAME] Copying 32-bit libraries and config files."
+        copy_directory objs/lib "$TEMP_PKG_DIR"/tools/lib
     fi
     if [ -d "objs/lib64" ]; then
-        for FILE in objs/emulator64-*; do
-            copy_file_into $FILE "$TEMP_PKG_DIR"/tools/
-        done
-        dump "[$PKG_NAME] Copying 64-bit GLES emulation libraries."
-        for LIB in $EMUGL_LIBRARIES; do
-            copy_file_into objs/lib64/lib64$LIB$DLLEXT \
-                           "$TEMP_PKG_DIR"/tools/lib64/
-        done
+        dump "[$PKG_NAME] Copying 64-bit libraries."
+        copy_directory objs/lib64 "$TEMP_PKG_DIR"/tools/lib64
     fi
-    if [ -d "objs/lib/pc-bios" ]; then
-        dump "[$PKG_NAME] Copying x86 PC BIOS ROM files."
-        copy_directory_files objs/lib/pc-bios \
-                "$TEMP_PKG_DIR"/tools/lib/pc-bios "*.bin"
+    if [ -d "objs/resources" ]; then
+        dump "[$PKG_NAME] Copying resources."
+        copy_directory objs/resources "$TEMP_PKG_DIR"/tools/resources
     fi
     if [ -d "objs/qemu" ]; then
-        QEMU_BINARIES=$(list_files_under objs/qemu "$SYSTEM-*/qemu-system-*")
+        QEMU_BINARIES=$(list_files_under objs/qemu \
+                "$SYSTEM-*/qemu-system-*" "$SYSTEM-*/qemu-upstream-*")
         if [ "$QEMU_BINARIES" ]; then
             for QEMU_BINARY in $QEMU_BINARIES; do
                 dump "[$PKG_NAME] Copying $QEMU_BINARY."
@@ -542,32 +604,13 @@ create_binaries_package () {
             done
         fi
     fi
+    if [ -d "objs/build/symbols" ]; then
+        dump "[$PKG_NAME] Copying Symbols."
+        copy_directory objs/build/symbols "$TEMP_PKG_DIR"/build/symbols
+    fi
 
-    # Copy Emugl backend directories, if any.
-    for EMUGL_BACKEND in $EMUGL_BACKEND_DIRS; do
-        MESA_LIBDIR=objs/lib/$EMUGL_BACKEND
-        if [ -d "$MESA_LIBDIR" ]; then
-            MESA_BINARIES=$(list_files_under "$MESA_LIBDIR" "")
-            if [ "$MESA_BINARIES" ] ;then
-                dump "[$PKG_NAME] Copying $EMUGL_BACKEND 32-bit binaries"
-                copy_directory_files \
-                        "$MESA_LIBDIR" \
-                        "$TEMP_PKG_DIR/tools/${MESA_LIBDIR#objs/}" \
-                        $MESA_BINARIES
-            fi
-        fi
-        MESA_LIBDIR=objs/lib64/$EMUGL_BACKEND
-        if [ -d "$MESA_LIBDIR" ]; then
-            MESA_BINARIES=$(list_files_under "$MESA_LIBDIR")
-            if [ "$MESA_BINARIES" ] ;then
-                dump "[$PKG_NAME] Copying $EMUGL_BACKEND 64-bit binaries"
-                copy_directory_files \
-                        "$MESA_LIBDIR" \
-                        "$TEMP_PKG_DIR/tools/${MESA_LIBDIR#objs/}" \
-                        $MESA_BINARIES
-            fi
-        fi
-    done
+    # Get rid of some extra files we don't really want
+    run rm -f "$TEMP_PKG_DIR"/tools/lib*/lib*emugl_test_shared_library*
 
     dump "[$PKG_NAME] Creating README file."
     cat > $TEMP_PKG_DIR/README <<EOF
@@ -582,7 +625,7 @@ EOF
 
     dump "[$PKG_NAME] Copying license files."
     mkdir -p "$TEMP_PKG_DIR"/licenses/
-    cp COPYING COPYING.LIB "$TEMP_PKG_DIR"/licenses/
+    cp android/qemu1/COPYING android/qemu1/COPYING.LIB "$TEMP_PKG_DIR"/licenses/
 
     dump "[$PKG_NAME] Creating tarball."
     PKG_FILE=$PKG_DIR/$PKG_PREFIX-$PKG_REVISION-$SYSTEM.tar.bz2
@@ -595,9 +638,9 @@ EOF
 # $2: Source package file.
 # $3: Darwin prebuilts directory.
 build_darwin_binaries_on () {
-    local HOST PKG_FILE PKG_FILE_BASENAME DST_DIR TARFLAGS
+    local DARWIN_SSH PKG_FILE PKG_FILE_BASENAME DST_DIR TARFLAGS
     local AOSP_DIR AOSP_PREBUILTS_DIR DARWIN_FLAGS SYSTEM QT_SUBDIR
-    HOST=$1
+    DARWIN_SSH=$1
     PKG_FILE=$2
     AOSP_PREBUILTS_DIR=$3
     AOSP_DIR=$AOSP_PREBUILTS_DIR/..
@@ -613,43 +656,99 @@ build_darwin_binaries_on () {
     fi
 
     # Where to do the work on the remote host.
-    builder_prepare_remote_darwin_build \
-            /tmp/$USER-android-emulator/$PKG_FILE_PREFIX
+    builder_prepare_remote_darwin_build
 
-    QT_SUBDIR=android-emulator-build/qt/
-    copy_directory "$AOSP_PREBUILTS_DIR"/$QT_SUBDIR/common \
-            "$DARWIN_PKG_DIR"/aosp/prebuilts/$QT_SUBDIR/common
-    copy_directory "$AOSP_PREBUILTS_DIR"/$QT_SUBDIR/darwin-x86_64 \
-            "$DARWIN_PKG_DIR"/aosp/prebuilts/$QT_SUBDIR/darwin-x86_64
-    run tar xf "$PKG_FILE" -C "$DARWIN_PKG_DIR"/..
+    AOSP_BUILD_PREBUILTS=$AOSP_PREBUILTS_DIR/android-emulator-build
+    DARWIN_BUILD_PREBUILTS=$DARWIN_PKG_DIR/aosp/prebuilts/android-emulator-build
+    AOSP_KERNEL_PREBUILTS=$AOSP_PREBUILTS_DIR/qemu-kernel
+    DARWIN_KERNEL_PREBUILTS=$DARWIN_PKG_DIR/aosp/prebuilts/qemu-kernel
+
+    if [ ! -d "$AOSP_KERNEL_PREBUILTS/x86/pc-bios" ]; then
+        panic "Missing pc-bios prebuilts!"
+    fi
+    copy_directory "$AOSP_KERNEL_PREBUILTS"/x86/pc-bios \
+            "$DARWIN_KERNEL_PREBUILTS"/x86/pc-bios
+
+    for LIB in qemu-android-deps curl common/e2fsprogs common/libxml2 \
+            common/breakpad qt common/ANGLE common/x264 common/ffmpeg \
+            common/lz4 common/libvpx common/libusb; do
+        if [ ! -d "$AOSP_BUILD_PREBUILTS/$LIB/darwin-x86_64" ]; then
+            panic "Missing $LIB Darwin prebuilts!"
+        fi
+        copy_directory "$AOSP_BUILD_PREBUILTS"/$LIB/darwin-x86_64 \
+                "$DARWIN_BUILD_PREBUILTS"/$LIB/darwin-x86_64
+    done
+
+    copy_directory "$AOSP_BUILD_PREBUILTS"/qt/common \
+            "$DARWIN_BUILD_PREBUILTS"/qt/common
+
+    if [ ! -d "$AOSP_BUILD_PREBUILTS"/protobuf ]; then
+        panic "Missing Darwin protobuf prebuilts!"
+    fi
+    copy_directory "$AOSP_BUILD_PREBUILTS"/protobuf \
+            "$DARWIN_BUILD_PREBUILTS"/protobuf
+
+    copy_directory "$AOSP_BUILD_PREBUILTS"/common/snapshots \
+            "$DARWIN_BUILD_PREBUILTS"/common/virtualscene
+
+    copy_directory "$AOSP_BUILD_PREBUILTS"/common/testdata \
+            "$DARWIN_BUILD_PREBUILTS"/common/testdata /
+
+    run tar xf "$PKG_FILE" -C "$DARWIN_PKG_DIR" --strip-components 1
 
     if [ "$AOSP_PREBUILTS_DIR" ]; then
         var_append DARWIN_BUILD_FLAGS "--aosp-prebuilts-dir=$DARWIN_REMOTE_DIR/aosp/prebuilts"
     else
         var_append DARWIN_BUILD_FLAGS "--no-aosp-prebuilts"
     fi
-    if [ "$OPT_UI" ]; then
-        var_append DARWIN_BUILD_FLAGS "--ui=$OPT_UI"
+    if [ "$OPT_GLES" ]; then
+        var_append DARWIN_BUILD_FLAGS "--gles=$OPT_GLES"
     fi
+    if [ "$OPT_NO_STRIP" ]; then
+        var_append DARWIN_BUILD_FLAGS "--no-strip"
+    fi
+    if [ "$OPT_TRACE" ]; then
+        var_append DARWIN_BUILD_FLAGS "--trace"
+    fi
+    if [ "$OPT_SYMBOLS" ]; then
+        var_append DARWIN_BUILD_FLAGS "--symbols"
+    fi
+    if [ "$OPT_DEBUG" ]; then
+        var_append DARWIN_BUILD_FLAGS "--debug"
+    fi
+    if [ "$OPT_PREBUILT_QEMU2" ]; then
+        var_append DARWIN_BUILD_FLAGS "--prebuilt-qemu2"
+    fi
+    if [ "$OPT_NO_TESTS" ]; then
+        var_append DARWIN_BUILD_FLAGS "--no-tests"
+    fi
+    if [ "$OPT_CRASH_STAGING" ]; then
+        var_append DARWIN_BUILD_FLAGS "--crash-staging"
+    elif [ "$OPT_CRASH_PROD" ]; then
+        var_append DARWIN_BUILD_FLAGS "--crash-prod"
+    fi
+
     cat > $DARWIN_PKG_DIR/build.sh <<EOF
 #!/bin/bash -l
 cd $DARWIN_REMOTE_DIR/qemu &&
-./android-rebuild.sh $DARWIN_BUILD_FLAGS
+./android/rebuild.sh $DARWIN_BUILD_FLAGS
 EOF
-    builder_run_remote_darwin_build ||
+    builder_run_remote_darwin_build "$DARWIN_PKG_DIR/build.sh" ||
         panic "Can't rebuild binaries on Darwin, use --verbose to see why!"
 
-    dump "Retrieving Darwin binaries from: $HOST"
+    dump "Retrieving Darwin binaries from: $DARWIN_SSH"
     # `pwd` == external/qemu
     rm -rf objs/*
-    run rsync -haz --delete --exclude=intermediates --exclude=libs $HOST:$DARWIN_REMOTE_DIR/qemu/objs .
-    # TODO(digit): Retrieve PC BIOS files.
+    builder_remote_darwin_rsync -haz --delete \
+            $DARWIN_SSH:$DARWIN_REMOTE_DIR/qemu/objs .
     dump "Deleting files off darwin system"
-    run ssh $HOST rm -rf $DARWIN_REMOTE_DIR
+    builder_remote_darwin_run rm -rf $DARWIN_REMOTE_DIR
 
-    if [ ! -d "obj/qemu" ]; then
+    if [ ! -d "objs/qemu" ]; then
+        # For --prebuilt-qemu2
         QEMU_PREBUILTS_DIR=$PREBUILTS_DIR/qemu-android
-        QEMU_BINARIES=$(list_files_under "$QEMU_PREBUILTS_DIR" "darwin-*/qemu-system-*")
+        QEMU_BINARIES=$(list_files_under "$QEMU_PREBUILTS_DIR" \
+                "darwin-*/qemu-system-*" "darwin-*/qemu-upstream-*")
         if [ "$QEMU_BINARIES" ]; then
             for QEMU_BINARY in $QEMU_BINARIES; do
                 dump "[$PKG_NAME] Copying $QEMU_BINARY"
@@ -680,8 +779,37 @@ else
     var_append REBUILD_FLAGS "--no-aosp-prebuilts-dir"
 fi
 
-if [ "$OPT_UI" ]; then
-    var_append REBUILD_FLAGS "--ui=$OPT_UI"
+if [ "$OPT_GLES" ]; then
+    var_append REBUILD_FLAGS "--gles=$OPT_GLES"
+fi
+
+if [ "$OPT_NO_STRIP" ]; then
+    var_append REBUILD_FLAGS "--no-strip"
+fi
+
+if [ "$OPT_TRACE" ]; then
+    var_append REBUILD_FLAGS "--trace"
+fi
+
+if [ "$OPT_SYMBOLS" ]; then
+    var_append REBUILD_FLAGS "--symbols"
+fi
+
+if [ "$OPT_DEBUG" ]; then
+    var_append REBUILD_FLAGS "--debug"
+fi
+
+
+if [ "$OPT_CLANG" ]; then
+    var_append REBUILD_FLAGS "--clang"
+fi
+
+if [ "$OPT_PREBUILT_QEMU2" ]; then
+    var_append REBUILD_FLAGS "--prebuilt-qemu2"
+fi
+
+if [ "$OPT_NO_TESTS" ]; then
+    var_append REBUILD_FLAGS "--no-tests"
 fi
 
 for SYSTEM in $(convert_host_list_to_os_list $LOCAL_HOST_SYSTEMS); do
@@ -691,13 +819,13 @@ for SYSTEM in $(convert_host_list_to_os_list $LOCAL_HOST_SYSTEMS); do
 
     case $SYSTEM in
         windows)
-            run ./android-rebuild.sh --mingw $REBUILD_FLAGS ||
-                    panic "Use ./android-rebuild.sh --mingw to see why."
+            run ./android/rebuild.sh --mingw $REBUILD_FLAGS ||
+                    panic "Use ./android/rebuild.sh --mingw to see why."
             ;;
 
         *)
-            run ./android-rebuild.sh $REBUILD_FLAGS ||
-                    panic "Use ./android-rebuild.sh to see why."
+            run ./android/rebuild.sh $REBUILD_FLAGS ||
+                    panic "Use ./android/rebuild.sh to see why."
     esac
 
     create_binaries_package "$SYSTEM"
@@ -722,46 +850,22 @@ if [ "$OPT_COPY_PREBUILTS" ]; then
         run mkdir -p "$DST_DIR" || panic "Could not create directory: $DST_DIR"
         DLLEXT=$(dll_ext_for $SYSTEM)
         EXEEXT=$(exe_ext_for $SYSTEM)
-        FILES="emulator$EXEEXT"
-        for ARCH in arm x86 mips; do
-            var_append FILES "emulator$BITNESS-$ARCH$EXEEXT"
-        done
-        var_append FILES $(list_files_under "$SRC_DIR/tools" \
-                "emulator-ranchu-*$EXEEXT" \
-                "emulator64-ranchu-*$EXEEXT")
-
-        if [ -d "$SRC_DIR/tools/lib$BITNESS" ]; then
-            for LIB in $EMUGL_LIBRARIES; do
-                var_append FILES "lib$BITNESS/lib$BITNESS$LIB$DLLEXT"
-            done
-        fi
-
-        if [ -d "$SRC_DIR/tools/qemu" ]; then
-            var_append FILES $(list_files_under "$SRC_DIR/tools" "qemu/*")
-        fi
+        FILES=$(list_files_under "$SRC_DIR"/tools \
+            emulator$EXEEXT \
+            "emulator$BITNESS-*$EXEEXT" \
+            lib/ca-bundle.pem \
+            lib/advancedFeatures.ini \
+            lib/advancedFeaturesCanary.ini \
+            lib/pc-bios \
+            "qemu/$SYSTEM-*/*" \
+            "bin$BITNESS/*" \
+            "lib$BITNESS/*" )
 
         # temporarily include linux 32 bit binaries
         if [ $SYSTEM = "linux" ]; then
-            BITNESS=
-            for ARCH in arm x86 mips; do
-                FILES="$FILES emulator-$ARCH$EXEEXT"
-            done
-            for LIB in $EMUGL_LIBRARIES; do
-                var_append FILES "lib/lib$LIB$DLLEXT"
-            done
+            var_append FILES $(list_files_under "$SRC_DIR"/tools \
+                    "emulator-*$EXEEXT" "bin/*" "lib/*")
         fi
-
-        # Copy Emugl backend files too.
-        for EMUGL_BACKEND in $EMUGL_BACKEND_DIRS; do
-            EMUGL_LIBDIR=lib/$EMUGL_BACKEND
-            for LIB in $(list_files_under "$SRC_DIR/tools/$EMUGL_LIBDIR"); do
-                var_append FILES "$EMUGL_LIBDIR/$LIB"
-            done
-            EMUGL_LIBDIR=lib64/$EMUGL_BACKEND
-            for LIB in $(list_files_under "$SRC_DIR/tools/$EMUGL_LIBDIR"); do
-                var_append FILES "$EMUGL_LIBDIR/$LIB"
-            done
-        done
 
         copy_directory_files "$SRC_DIR/tools" "$DST_DIR" "$FILES" ||
                 panic "Could not copy binaries to $DST_DIR"
@@ -797,7 +901,7 @@ EOF
         if [ "$CUR_SHA1" != "$PREV_SHA1" ]; then
             GIT_LOG_COMMAND="cd $AOSP_SUBDIR && git log --oneline --no-merges $PREV_SHA1..$CUR_SHA1 ."
             printf "    $ %s\n" "$GIT_LOG_COMMAND" >> $README_FILE
-            (cd $QEMU_DIR/../.. && eval $GIT_LOG_COMMAND) | while read LINE; do
+            (cd $AOSP_TMPDIR && eval $GIT_LOG_COMMAND) | while read LINE; do
                 printf "        %s\n" "$LINE" >> $README_FILE
             done
             printf "\n" >> $README_FILE
